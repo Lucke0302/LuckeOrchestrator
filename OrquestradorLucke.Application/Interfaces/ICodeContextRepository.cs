@@ -36,4 +36,15 @@ public interface ICodeContextRepository
     /// </summary>
     /// <param name="cancellationToken">Token de cancelamento da iteração do worker.</param>
     Task<Dictionary<string, string>> GetTrackedContentHashesAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Remove do índice todo documento cujo <see cref="CodeDocument.FilePath"/> não esteja entre os
+    /// caminhos ativos — faxina dos arquivos deletados/renomeados na branch base, que o upsert
+    /// (que só insere e atualiza) deixaria para sempre no índice do RAG.
+    /// </summary>
+    /// <param name="activeFilePaths">
+    /// Caminhos da árvore atual do repositório (a fonte de verdade do que continua vivo).
+    /// </param>
+    /// <param name="cancellationToken">Token de cancelamento da iteração do worker.</param>
+    Task DeleteOrphanDocumentsAsync(IEnumerable<string> activeFilePaths, CancellationToken cancellationToken);
 }

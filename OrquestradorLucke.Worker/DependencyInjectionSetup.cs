@@ -48,8 +48,10 @@ public static class DependencyInjectionSetup
 
         services.AddPostgresPersistence(connectionString);
 
-        // Circuit Breaker de cota: estado único e compartilhado por todo o host.
-        services.AddSingleton<IQuotaManager, InMemoryQuotaManager>();
+        // Circuit Breaker de cota: persistido no PostgreSQL (tabela quota_states) e resolvido no
+        // escopo da iteração, junto do AppDbContext — o bloqueio aplicado em um 429 sobrevive ao
+        // reinício do daemon e vale para todas as instâncias que apontam para o mesmo banco.
+        services.AddScoped<IQuotaManager, DbQuotaManager>();
 
         var resilience = ReadResilienceOptions(configuration);
 
@@ -73,6 +75,11 @@ public static class DependencyInjectionSetup
         // RAG: índice vetorial (pgvector) e indexador incremental da base de código.
         services.AddScoped<ICodeContextRepository, CodeContextRepository>();
         services.AddScoped<CodebaseIndexerService>();
+
+        // Gatilho da indexação: canal Singleton (capacidade 1, DropWrite) que o webhook alimenta e o
+        // IndexingBackgroundService consome — uma rajada de entregas vira um único pedido pendente e
+        // o PostgreSQL recebe uma conexão por vez.
+        services.AddSingleton<IndexingChannel>();
 
         return services;
     }

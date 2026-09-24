@@ -21,6 +21,9 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     /// <summary>Documentos de código indexados para o RAG (tabela <c>code_documents</c>).</summary>
     public DbSet<CodeDocument> CodeDocuments => Set<CodeDocument>();
 
+    /// <summary>Circuit Breaker de cota persistido (tabela <c>quota_states</c>).</summary>
+    public DbSet<QuotaState> QuotaStates => Set<QuotaState>();
+
     /// <summary>Configura a extensão vetorial e o mapeamento explícito das entidades.</summary>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -32,6 +35,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
 
         ConfigureAgentTask(modelBuilder);
         ConfigureCodeDocument(modelBuilder);
+        ConfigureQuotaState(modelBuilder);
     }
 
     /// <summary>
@@ -146,6 +150,37 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
                 .HasMethod("hnsw")
                 .HasOperators("vector_cosine_ops")
                 .HasDatabaseName("ix_code_documents_embedding_hnsw");
+        });
+    }
+
+    /// <summary>
+    /// Mapeamento explícito de <see cref="QuotaState"/> (Circuit Breaker de cota persistido).
+    /// </summary>
+    private static void ConfigureQuotaState(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<QuotaState>(entity =>
+        {
+            entity.ToTable("quota_states");
+            entity.HasKey(state => state.Id).HasName("pk_quota_states");
+
+            // O identificador é gerado pelo domínio (Guid.NewGuid()), não pelo banco.
+            entity.Property(state => state.Id)
+                .HasColumnName("id")
+                .ValueGeneratedNever();
+
+            entity.Property(state => state.ProviderName)
+                .HasColumnName("provider_name")
+                .HasMaxLength(255)
+                .IsRequired();
+
+            entity.Property(state => state.LockedUntil)
+                .HasColumnName("locked_until")
+                .IsRequired();
+
+            // Chave natural do bloqueio: o Circuit Breaker procura o estado pelo nome do provedor.
+            entity.HasIndex(state => state.ProviderName)
+                .IsUnique()
+                .HasDatabaseName("ux_quota_states_provider_name");
         });
     }
 }

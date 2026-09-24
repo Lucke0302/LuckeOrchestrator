@@ -15,6 +15,7 @@ namespace OrquestradorLucke.Infrastructure.Data;
 /// $env:ConnectionStrings__DefaultConnection='Host=localhost;Database=lucke;Username=postgres;Password=...'
 /// dotnet ef migrations add &lt;Nome&gt;        --project OrquestradorLucke.Infrastructure --output-dir Data/Migrations
 /// dotnet ef migrations add AddHnswIndex  --project OrquestradorLucke.Infrastructure --output-dir Data/Migrations
+/// dotnet ef migrations add AddQuotaState  --project OrquestradorLucke.Infrastructure --output-dir Data/Migrations
 /// dotnet ef migrations list              --project OrquestradorLucke.Infrastructure
 /// dotnet ef database update              --project OrquestradorLucke.Infrastructure
 /// dotnet ef database drop --force        --project OrquestradorLucke.Infrastructure

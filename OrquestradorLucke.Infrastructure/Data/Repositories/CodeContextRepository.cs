@@ -106,4 +106,22 @@ public sealed class CodeContextRepository(AppDbContext context) : ICodeContextRe
 
         return hashes;
     }
+
+    /// <inheritdoc />
+    public async Task DeleteOrphanDocumentsAsync(IEnumerable<string> activeFilePaths, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(activeFilePaths);
+
+        // Array + Distinct: o EF Core traduz o Contains sobre uma coleção em memória para
+        // 'file_path = ANY(@p)' no Npgsql, e a lista sem duplicatas mantém o parâmetro pequeno
+        // (a árvore C# de um repositório tem centenas de arquivos).
+        var activePaths = activeFilePaths.Distinct(StringComparer.Ordinal).ToArray();
+
+        // ExecuteDelete: o DELETE é emitido direto no banco, sem materializar os órfãos (o conteúdo
+        // e o embedding de cada um são pesados) e sem passar pelo change tracker.
+        await context.CodeDocuments
+            .Where(document => !activePaths.Contains(document.FilePath))
+            .ExecuteDeleteAsync(cancellationToken)
+            .ConfigureAwait(false);
+    }
 }

@@ -1,11 +1,18 @@
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
-using OrquestradorLucke.Application.Services;
 using OrquestradorLucke.Worker;
 
 // Host web (Kestrel) + BackgroundService: o daemon mantém o laço do orquestrador e passa a expor um
 // endpoint HTTP — o webhook do GitHub dispara a indexação sob demanda, no lugar do polling.
 var builder = WebApplication.CreateBuilder(args);
+
+// Chave de configuração do segredo compartilhado com o GitHub e nome do cabeçalho de assinatura:
+// nenhum dos dois é hardcoded — o segredo vem de user-secrets/variável de ambiente.
+const string GitHubWebhookSecretKey = "GitHub:WebhookSecret";
+const string HubSignatureHeaderName = "X-Hub-Signature-256";
+const string SignaturePrefix = "sha256=";
 
 // Daemon no Linux: habilita o Type=notify (sd_notify) e o formatter do journald. A extensão é
 // context-aware — só ativa quando o processo roda sob systemd (ou NOTIFY_SOCKET no Unix), mantendo
@@ -13,26 +20,62 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSystemd();
 
 // Composição da injeção de dependência: IOptions, um expert do Google AI Studio por modelo do
-// catálogo MoE, o expert de embeddings do RAG, Circuit Breaker de cota (Singleton), política de
-// resiliência (Polly) e a persistência PostgreSQL/pgvector.
+// catálogo MoE, o expert de embeddings do RAG, Circuit Breaker de cota persistido (Scoped), política
+// de resiliência (Polly), a persistência PostgreSQL/pgvector e o canal de gatilho da indexação.
 builder.Services.AddOrchestrator(builder.Configuration);
+
+// Laço do orquestrador (fila → expert → branch/commit/PR) e consumidor do gatilho de indexação, que
+// serializa as entregas do webhook (uma indexação por vez).
+builder.Services.AddHostedService<LuckeOrchestratorWorker>();
+builder.Services.AddHostedService<IndexingBackgroundService>();
 
 // Valida o grafo de DI antes de subir: dependência não registrada (ou serviço Scoped consumido pela
 // raiz) falha aqui, no start do daemon, em vez de aparecer só no journal da primeira iteração.
 DependencyInjectionSetup.ValidateOrchestratorComposition(builder.Services);
 
-builder.Services.AddHostedService<LuckeOrchestratorWorker>();
-
 var app = builder.Build();
 
 // Webhook do GitHub: substitui o polling do indexador (Orchestrator:IndexingIntervalMinutes) por um
-// gancho pós-merge. Responde 202 imediatamente — o GitHub cancela entregas que passam de ~10 s — e
-// sincroniza o índice em background, em um escopo próprio (o CodebaseIndexerService é Scoped).
-app.MapPost("/api/webhook/github", (IServiceScopeFactory scopeFactory, ILoggerFactory loggerFactory) =>
+// gancho pós-merge. Valida o HMAC-SHA256 do corpo bruto (X-Hub-Signature-256) contra o segredo
+// configurado, responde 401 quando a assinatura não confere e, quando confere, publica o gatilho no
+// IndexingChannel e responde 202 imediatamente — quem indexa é o IndexingBackgroundService.
+app.MapPost("/api/webhook/github", async (
+    HttpContext context,
+    IConfiguration configuration,
+    IndexingChannel indexingChannel,
+    ILoggerFactory loggerFactory) =>
 {
-    _ = SynchronizeCodebaseIndexAsync(
-        scopeFactory,
-        loggerFactory.CreateLogger("OrquestradorLucke.Webhook.GitHub"));
+    var logger = loggerFactory.CreateLogger("OrquestradorLucke.Webhook.GitHub");
+    var webhookSecret = configuration[GitHubWebhookSecretKey];
+
+    if (string.IsNullOrWhiteSpace(webhookSecret))
+    {
+        // Fail closed: sem segredo não há como autenticar a entrega — o gatilho não é aceito.
+        logger.LogError(
+            "Webhook do GitHub recusado: a chave de configuração '{ConfigurationKey}' não está definida.",
+            GitHubWebhookSecretKey);
+
+        return Results.StatusCode(StatusCodes.Status500InternalServerError);
+    }
+
+    // O HMAC é calculado sobre os BYTES do corpo: ler como string e recodificar poderia alterar o
+    // payload (BOM, normalização de quebras de linha) e invalidar a assinatura de uma entrega legítima.
+    using var bodyBuffer = new MemoryStream();
+
+    await context.Request.Body.CopyToAsync(bodyBuffer, context.RequestAborted);
+
+    var signature = context.Request.Headers[HubSignatureHeaderName].ToString();
+
+    if (!IsSignatureValid(webhookSecret, bodyBuffer.ToArray(), signature))
+    {
+        logger.LogWarning("Webhook do GitHub recusado: assinatura HMAC-SHA256 ausente ou inválida.");
+
+        return Results.Unauthorized();
+    }
+
+    // Debounce: com um pedido já na fila, o TryWrite é descartado (DropWrite) — cinco entregas em
+    // rajada viram uma única indexação, e a resposta sai antes de qualquer trabalho pesado.
+    indexingChannel.TryWrite(true);
 
     return Results.Accepted();
 });
@@ -40,39 +83,41 @@ app.MapPost("/api/webhook/github", (IServiceScopeFactory scopeFactory, ILoggerFa
 app.Run();
 
 /// <summary>
-/// Sincroniza o índice vetorial do RAG em background, no escopo criado para a execução do webhook.
+/// Valida a assinatura HMAC-SHA256 do corpo bruto (<c>X-Hub-Signature-256: sha256=&lt;hex&gt;</c>)
+/// contra o segredo configurado.
 /// </summary>
 /// <remarks>
-/// O disparo é "fire-and-forget" de propósito: o GitHub espera a resposta em segundos e a indexação
-/// é best-effort — o índice atual continua servindo de contexto e o próximo ciclo (intervalo ou novo
-/// webhook) reindexa o que faltou. O <see cref="IServiceScopeFactory"/> é obrigatório porque o
-/// <see cref="CodebaseIndexerService"/> e o <c>DbContext</c> que ele consome são Scoped.
+/// A comparação usa <see cref="CryptographicOperations.FixedTimeEquals"/>: comparar as strings com
+/// <c>==</c> vazaria o tempo de resposta por caractere e permitiria descobrir a assinatura correta
+/// por tentativa e erro.
 /// </remarks>
-static async Task SynchronizeCodebaseIndexAsync(IServiceScopeFactory scopeFactory, ILogger logger)
+/// <param name="secret">Segredo compartilhado com o GitHub (<c>GitHub:WebhookSecret</c>).</param>
+/// <param name="body">Bytes do corpo bruto da requisição.</param>
+/// <param name="signatureHeader">Valor do cabeçalho <c>X-Hub-Signature-256</c>.</param>
+/// <returns><c>true</c> apenas quando a assinatura confere com o HMAC do corpo.</returns>
+static bool IsSignatureValid(string secret, byte[] body, string signatureHeader)
 {
+    if (string.IsNullOrWhiteSpace(signatureHeader)
+        || !signatureHeader.StartsWith(SignaturePrefix, StringComparison.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    byte[] providedSignature;
+
     try
     {
-        using var scope = scopeFactory.CreateScope();
-
-        var codeIndexer = scope.ServiceProvider.GetRequiredService<CodebaseIndexerService>();
-
-        var result = await codeIndexer
-            .IndexChangedDocumentsAsync(CancellationToken.None)
-            .ConfigureAwait(false);
-
-        logger.LogInformation(
-            "Índice do RAG sincronizado pelo webhook: {Indexed} documento(s) novos/alterados entre {Discovered} arquivo(s) C#{Skipped}.",
-            result.IndexedDocuments,
-            result.DiscoveredFiles,
-            result.SkippedDocuments > 0
-                ? $"; {result.SkippedDocuments} descartado(s) por não gerarem embedding"
-                : string.Empty);
+        providedSignature = Convert.FromHexString(signatureHeader[SignaturePrefix.Length..].Trim());
     }
-    catch (Exception ex)
+    catch (FormatException)
     {
-        // Nada é propagado: a entrega do webhook já foi aceita e a indexação é enriquecimento do RAG.
-        logger.LogError(ex, "Falha ao sincronizar o índice do RAG pelo webhook do GitHub.");
+        // Assinatura que não é hexadecimal não tem como conferir: entrega recusada.
+        return false;
     }
+
+    using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
+
+    return CryptographicOperations.FixedTimeEquals(hmac.ComputeHash(body), providedSignature);
 }
 
 

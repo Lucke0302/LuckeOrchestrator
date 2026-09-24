@@ -85,6 +85,13 @@ public sealed class CodebaseIndexerService(
             indexed++;
         }
 
+        // Faxina do índice: o upsert só insere e atualiza, então um arquivo deletado (ou renomeado)
+        // na branch base continuaria sendo recuperado como referência pelo RAG. As chaves do
+        // dicionário lido do GitHub são a árvore atual — o que não está nelas virou documento órfão.
+        await codeContextRepository
+            .DeleteOrphanDocumentsAsync(files.Keys, cancellationToken)
+            .ConfigureAwait(false);
+
         return new CodebaseIndexingResult(files.Count, indexed, skipped);
     }
 

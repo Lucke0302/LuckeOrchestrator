@@ -24,6 +24,14 @@
     <ProjectReference Include="..\OrquestradorLucke.Domain\OrquestradorLucke.Domain.csproj" />
     <ProjectReference Include="..\OrquestradorLucke.Application\OrquestradorLucke.Application.csproj" />
     <ProjectReference Include="..\OrquestradorLucke.Infrastructure\OrquestradorLucke.Infrastructure.csproj" />
+    <!-- Host: a composição de DI e o BackgroundService do daemon também são validados pelos testes. -->
+    <ProjectReference Include="..\OrquestradorLucke.Worker\OrquestradorLucke.Worker.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Hosting/ASP.NET Core (IServiceCollection, ConfigurationBuilder in-memory, IHostedService):
+         mesmo FrameworkReference do Worker, sem pacotes duplicados. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
 </Project>

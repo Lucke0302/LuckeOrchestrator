@@ -17,10 +17,11 @@ namespace OrquestradorLucke.Worker;
 /// conta de agente autônomo.
 /// </summary>
 /// <remarks>
-/// Falhas de geração alimentam o <see cref="FrustrationTracker"/> do daemon: ao atingir
-/// <c>Frustration:MaxFailures</c> o circuito desarma e a tarefa ganha uma última tentativa no modelo
-/// mais robusto do catálogo (<see cref="ITaskRouter.ResolveOverdriveProvider"/>) antes de ser
-/// marcada como <c>Falhou</c>.
+/// Falhas de geração alimentam o <see cref="FrustrationTracker"/> do daemon: cada motivo é guardado
+/// no histórico e, ao atingir <c>Frustration:MaxFailures</c>, o circuito desarma — a tarefa ganha uma
+/// última tentativa no modelo mais robusto do catálogo
+/// (<see cref="ITaskRouter.ResolveOverdriveProvider"/>) acompanhada do histórico de erros, para que o
+/// expert maior não repita o que o menor errou. Só então a tarefa é marcada como <c>Falhou</c>.
 /// </remarks>
 public sealed class LuckeOrchestratorWorker(
     IServiceScopeFactory scopeFactory,
@@ -128,17 +129,24 @@ public sealed class LuckeOrchestratorWorker(
                 {
                     var overdriveProvider = taskRouter.ResolveOverdriveProvider();
 
+                    // Memória da frustração: o histórico de motivos entra no parâmetro de contexto
+                    // junto com o RAG, para o modelo mais robusto não repetir o erro do expert menor.
+                    var overdriveContext = ComposeOverdriveContext(
+                        contextAnalysis,
+                        BuildFailureHistory(frustrationTracker));
+
                     logger.LogWarning(
-                        "Ativando Overdrive na tarefa {TaskId}: {Falhas} falha(s) acumulada(s) no limite de {Limite}; escalando para o expert '{ModelName}'.",
+                        "Ativando Overdrive na tarefa {TaskId}: {Falhas} falha(s) acumulada(s) no limite de {Limite}; escalando para o expert '{ModelName}' com {Historico} erro(s) de contexto.",
                         task.Id,
                         frustrationTracker.ContadorAtual,
                         frustrationTracker.LimiteMaximo,
-                        overdriveProvider.ModelName);
+                        overdriveProvider.ModelName,
+                        frustrationTracker.HistoricoFalhas.Count);
 
                     artifacts = await TryGenerateArtifactsAsync(
                             overdriveProvider,
                             task,
-                            contextAnalysis,
+                            overdriveContext,
                             frustrationTracker,
                             stoppingToken)
                         .ConfigureAwait(false);
@@ -326,7 +334,13 @@ public sealed class LuckeOrchestratorWorker(
         string reason,
         Exception? exception = null)
     {
-        var overdriveTriggered = frustrationTracker.RegistrarFalha();
+        // Motivo registrado no histórico: modelo + razão + mensagem da exceção quando houver. É esse
+        // texto que o overdrive recebe como contexto para não repetir a mesma falha.
+        var failure = exception is null
+            ? $"{provider.ModelName}: {reason}"
+            : $"{provider.ModelName}: {reason} ({exception.Message})";
+
+        var overdriveTriggered = frustrationTracker.RegistrarFalha(failure);
 
         logger.LogWarning(
             exception,
@@ -338,6 +352,34 @@ public sealed class LuckeOrchestratorWorker(
             frustrationTracker.LimiteMaximo,
             overdriveTriggered);
     }
+
+    /// <summary>
+    /// Formata o histórico de falhas do medidor na instrução de contexto entregue ao expert mais
+    /// robusto no overdrive: o modelo maior recebe explicitamente o que o menor errou.
+    /// </summary>
+    private static string BuildFailureHistory(FrustrationTracker frustrationTracker)
+    {
+        var builder = new StringBuilder("ATENÇÃO: Tentativas anteriores falharam. Evite os seguintes erros:");
+
+        foreach (var failure in frustrationTracker.HistoricoFalhas)
+        {
+            builder
+                .AppendLine()
+                .Append("- ")
+                .Append(failure);
+        }
+
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Concatena o contexto do RAG com o histórico de falhas, descartando as partes vazias — o expert
+    /// recebe os documentos de referência e, abaixo deles, os erros a evitar.
+    /// </summary>
+    private static string ComposeOverdriveContext(string ragContext, string failureHistory)
+        => string.IsNullOrWhiteSpace(ragContext)
+            ? failureHistory
+            : $"{ragContext}{Environment.NewLine}{Environment.NewLine}{failureHistory}";
 
     /// <summary>
     /// Persiste a transição de status preservando os demais campos do record (payload, branch, PR).
