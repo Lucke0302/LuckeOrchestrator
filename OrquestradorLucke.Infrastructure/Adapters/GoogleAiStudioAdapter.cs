@@ -89,6 +89,9 @@ public sealed class GoogleAiStudioAdapter(
     /// provedor de embeddings, <see cref="ModelName"/> aponta para o modelo de embeddings do
     /// <c>ModelCatalog</c> — que não participa das cadeias MoE — e um eventual 429 bloqueia apenas
     /// esse modelo no Circuit Breaker de cota, preservando o rodízio dos experts de geração.
+    /// O corpo fixa <c>outputDimensionality</c> (ver <see cref="AiStudioOptions.EmbeddingOutputDimensions"/>):
+    /// sem esse campo o modelo devolveria 3072 dimensões e o pgvector recusaria a gravação na coluna
+    /// <c>vector(768)</c> de <c>code_documents</c>.
     /// </remarks>
     public async Task<ReadOnlyMemory<float>> GenerateEmbeddingAsync(string text, CancellationToken cancellationToken)
     {
@@ -97,13 +100,19 @@ public sealed class GoogleAiStudioAdapter(
 
         using var request = new HttpRequestMessage(HttpMethod.Post, BuildRequestUri(EmbedContentOperation))
         {
+            // O 'outputDimensionality' vai na RAIZ do corpo — é parâmetro do request do embedContent,
+            // não do conteúdo embutido — e o modelo trunca o vetor (Matryoshka) para a dimensão
+            // contratada pela coluna vector(768). O objeto anônimo é serializado como está (as
+            // propriedades já são nomeadas em camelCase, sem naming policy), então o campo sai na API
+            // exatamente como "outputDimensionality".
             Content = JsonContent.Create(new
             {
                 model = QualifiedModelName,
                 content = new
                 {
                     parts = new[] { new { text } }
-                }
+                },
+                outputDimensionality = _options.EmbeddingOutputDimensions
             })
         };
 

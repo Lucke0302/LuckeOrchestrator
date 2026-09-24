@@ -23,6 +23,18 @@ public sealed class AiStudioOptions
     /// </summary>
     public string ModelName { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Dimensão solicitada ao modelo de embeddings na raiz do corpo do <c>embedContent</c>
+    /// (<c>outputDimensionality</c>).
+    /// </summary>
+    /// <remarks>
+    /// Derivada de <see cref="ModelCatalog.EmbeddingDimensions"/> de propósito, e sem setter: a coluna
+    /// <c>embedding</c> de <c>code_documents</c> é <c>vector(768)</c> desde a migration, então um valor
+    /// configurável aqui só poderia divergir do banco e fazer o pgvector recusar a gravação. Não é
+    /// lida do appsettings — quem trocar o modelo de embeddings precisa manter a mesma constante.
+    /// </remarks>
+    public int EmbeddingOutputDimensions => ModelCatalog.EmbeddingDimensions;
+
     /// <summary>Janela de bloqueio do modelo quando a cota diária é esgotada (HTTP 429), em horas.</summary>
     public int QuotaLockoutHours { get; set; } = 24;
 

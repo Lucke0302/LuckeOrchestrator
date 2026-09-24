@@ -45,12 +45,25 @@ public static class ModelCatalog
     /// Modelo de embeddings do RAG (base de código). Não participa das cadeias MoE: não gera código,
     /// apenas vetores que alimentam a coluna <c>vector</c> de <c>code_documents</c>.
     /// </summary>
-    public const string TextEmbedding004 = "models/text-embedding-004";
+    /// <remarks>
+    /// Substitui o <c>models/text-embedding-004</c>, descontinuado no Google AI Studio. O prefixo
+    /// <c>models/</c> é mantido porque é o formato exigido no campo <c>model</c> do corpo do
+    /// <c>embedContent</c>; o adapter remove o prefixo para montar a rota
+    /// (<c>{ApiVersion}/models/{model}:embedContent</c>) e o repõe no corpo.
+    /// </remarks>
+    public const string GeminiEmbedding2 = "models/gemini-embedding-2";
 
     /// <summary>
-    /// Dimensão dos vetores produzidos por <see cref="TextEmbedding004"/> — é o <c>d</c> da coluna
-    /// <c>vector(d)</c> do pgvector e precisa ser fixo para o índice e as consultas casarem.
+    /// Dimensão contratada dos vetores do RAG — é o <c>d</c> da coluna <c>vector(d)</c> do pgvector e
+    /// precisa ser fixo para o índice HNSW e as consultas casarem.
     /// </summary>
+    /// <remarks>
+    /// O <see cref="GeminiEmbedding2"/> devolve 3072 dimensões por padrão; é este valor que vai como
+    /// <c>outputDimensionality</c> no corpo do <c>embedContent</c> (o modelo suporta truncamento
+    /// Matryoshka), garantindo que a resposta caiba na coluna <c>vector(768)</c>. Como a coluna é
+    /// declarada a partir desta constante (pelo <c>AppDbContext</c>) e a requisição também
+    /// (<see cref="AiStudioOptions.EmbeddingOutputDimensions"/>), os dois lados não podem divergir.
+    /// </remarks>
     public const int EmbeddingDimensions = 768;
 
     /// <summary>

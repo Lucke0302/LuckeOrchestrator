@@ -61,11 +61,11 @@ public static class DependencyInjectionSetup
         // embeddings do catálogo (que não participa das cadeias MoE) e com Named Client próprio.
         // A cota é contabilizada por modelo, então um 429 nos embeddings não bloqueia a geração.
         services
-            .AddHttpClient(ModelCatalog.TextEmbedding004, ConfigureAiStudioClient)
+            .AddHttpClient(ModelCatalog.GeminiEmbedding2, ConfigureAiStudioClient)
             .AddTransientHttpErrorPolicy(policyBuilder => CreateTransientRetryPolicy(policyBuilder, resilience));
 
         services.AddTransient<IEmbeddingProvider>(
-            serviceProvider => CreateAiStudioExpert(serviceProvider, ModelCatalog.TextEmbedding004));
+            serviceProvider => CreateAiStudioExpert(serviceProvider, ModelCatalog.GeminiEmbedding2));
 
         // Serviços resolvidos a cada iteração (escopo do laço do BackgroundService).
         services.AddScoped<IGitHubService, GitHubAdapter>();

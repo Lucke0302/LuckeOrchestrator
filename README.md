@@ -36,7 +36,7 @@ trabalho** é o índice vetorial da base de código.
                  │                                                                               │
  PostgreSQL      │  1. CodebaseIndexerService ──► GitHub: árvore da branch base (só .cs)         │
  agent_tasks     │         └─ SHA-256 por arquivo ──► upsert apenas do que é novo/mudou           │
- (fila) ───────► │  2. IEmbeddingProvider (text-embedding-004) ──► pgvector: code_documents      │
+ (fila) ───────► │  2. IEmbeddingProvider (gemini-embedding-2) ──► pgvector: code_documents      │
    dequeue       │  3. SearchSimilarAsync(limit 3) ──► "Arquivos de referência: ..." (contexto)  │
                  │  4. ITaskRouter.ResolveProvider(complexidade) ──► expert da cadeia MoE        │
                  │  5. ILLMProvider.GenerateCodeAsync(payload, contexto) ──► arquivos (JSON)     │
@@ -279,14 +279,24 @@ Embedding      ReadOnlyMemory<float>                                  embedding 
                               └─► DeleteOrphanDocumentsAsync(paths)
 ```
 
-- **Modelo de embeddings:** `models/text-embedding-004`, em
-  `POST {ApiVersion}/models/{model}:embedContent` com o corpo
-  `{"model": "models/text-embedding-004", "content": {"parts": [{"text": "..."}]}}`; o vetor vem de
-  `response.embedding.values`. O próprio `GoogleAiStudioAdapter` implementa `IEmbeddingProvider`
-  reaproveitando o tratamento de 429/cota e falhas transitórias do `generateContent`, com Named
-  Client próprio — um 429 de embedding bloqueia só o modelo de embeddings, sem tirar experts do
-  rodízio MoE. Resposta sem `embedding.values` devolve vetor vazio e o documento é descartado (nunca
-  se grava vetor degenerado).
+- **Modelo de embeddings:** `models/gemini-embedding-2` (o `models/text-embedding-004` foi
+  descontinuado), em `POST {ApiVersion}/models/{model}:embedContent` com o corpo
+  `{"model": "models/gemini-embedding-2", "content": {"parts": [{"text": "..."}]}, "outputDimensionality": 768}`;
+  o vetor vem de `response.embedding.values`. O próprio `GoogleAiStudioAdapter` implementa
+  `IEmbeddingProvider` reaproveitando o tratamento de 429/cota e falhas transitórias do
+  `generateContent`, com Named Client próprio — um 429 de embedding bloqueia só o modelo de
+  embeddings, sem tirar experts do rodízio MoE. Resposta sem `embedding.values` devolve vetor vazio e
+  o documento é descartado (nunca se grava vetor degenerado).
+- **Dimensão da requisição:** o `gemini-embedding-2` devolve **3072 dimensões por padrão**, mas a
+  coluna `embedding` é `vector(768)` — por isso o `outputDimensionality` (truncamento Matryoshka) é
+  enviado na raiz do corpo, com o valor de `ModelCatalog.EmbeddingDimensions`. A constante é a mesma
+  que declara a coluna (`AppDbContext`), então requisição e banco não podem divergir; um vetor de
+  3072 posições seria recusado pelo pgvector na gravação.
+- **Troca de modelo exige reindexação:** os vetores já gravados em `code_documents` foram produzidos
+  pelo `text-embedding-004` e vivem em **outro espaço vetorial** — mesma dimensão (`768`) não torna as
+  distâncias comparáveis. Como a indexação incremental decide por `content_hash` (que não muda sozinho),
+  a troca de modelo **não** reindexa: rode `TRUNCATE TABLE code_documents;` para que o próximo ciclo
+  regenere o índice com o `gemini-embedding-2`.
 - **Mapeamento do vetor:** o Domain expõe `ReadOnlyMemory<float>` e não conhece o pgvector; o
   `AppDbContext` declara a coluna `vector(ModelCatalog.EmbeddingDimensions)` = `vector(768)` com um
   conversor para `Pgvector.Vector` — o CLR type que o provider sabe mapear e parametrizar.
