@@ -2,6 +2,8 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using FluentAssertions;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
 using OrquestradorLucke.Application.Interfaces;
@@ -88,7 +90,8 @@ public sealed class GoogleAiStudioAdapterEmbeddingTests
         return new GoogleAiStudioAdapter(
             httpClient,
             Options.Create(options.ForModel(modelName)),
-            Mock.Of<IQuotaManager>());
+            Mock.Of<IQuotaManager>(),
+            NullLogger<GoogleAiStudioAdapter>.Instance);
     }
 
     /// <summary>Handler de teste: captura a requisição e devolve um envelope <c>embedContent</c> fixo.</summary>

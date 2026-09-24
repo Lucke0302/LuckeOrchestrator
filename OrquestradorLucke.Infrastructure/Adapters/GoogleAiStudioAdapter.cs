@@ -1,6 +1,8 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OrquestradorLucke.Application.Interfaces;
 using OrquestradorLucke.Domain;
@@ -23,12 +25,26 @@ namespace OrquestradorLucke.Infrastructure.Adapters;
 public sealed class GoogleAiStudioAdapter(
     HttpClient httpClient,
     IOptions<AiStudioOptions> options,
-    IQuotaManager quotaManager) : ILLMProvider, IEmbeddingProvider, IDisposable
+    IQuotaManager quotaManager,
+    ILogger<GoogleAiStudioAdapter> logger) : ILLMProvider, IEmbeddingProvider, IDisposable
 {
     private const string ApiKeyHeaderName = "x-goog-api-key";
     private const string ModelsPathSegment = "models/";
     private const string GenerateContentOperation = ":generateContent";
     private const string EmbedContentOperation = ":embedContent";
+
+    /// <summary>
+    /// Tamanho da prévia da resposta do LLM registrada no log. O corpo inteiro é uma string longa e
+    /// multilinha (código gerado): o journal do Linux a substitui por <c>[blob data]</c> e o operador
+    /// fica sem evidência do que o modelo devolveu.
+    /// </summary>
+    private const int LogPreviewLength = 200;
+
+    /// <summary>Caracteres de controle (quebras de linha, tabs, formatação) que virariam ruído no log.</summary>
+    private static readonly Regex ControlCharacterRegex = new(@"[\p{C}]+", RegexOptions.Compiled);
+
+    /// <summary>Sequências de espaços/indentação colapsadas em um único espaço na prévia do log.</summary>
+    private static readonly Regex WhitespaceRunRegex = new(@"\s{2,}", RegexOptions.Compiled);
 
     /// <summary>
     /// Instrução de geração de código. O contrato de múltiplos arquivos é fixado no próprio prompt
@@ -51,6 +67,7 @@ public sealed class GoogleAiStudioAdapter(
 
     private readonly AiStudioOptions _options = options.Value;
     private readonly IQuotaManager _quotaManager = quotaManager;
+    private readonly ILogger<GoogleAiStudioAdapter> _logger = logger;
 
     /// <summary>Identificador do modelo configurado para este adapter.</summary>
     public string ModelName => _options.ModelName;
@@ -77,7 +94,16 @@ public sealed class GoogleAiStudioAdapter(
                 cancellationToken)
             .ConfigureAwait(false);
 
-        return ExtractFileArtifacts(modelOutput);
+        var artifacts = ExtractFileArtifacts(modelOutput);
+
+        // Auditoria do parse: quantos arquivos sobreviveram à desserialização do JSON do LLM. O número
+        // é registrado antes de qualquer efeito no repositório — entrega vazia não passa silenciosa.
+        _logger.LogInformation(
+            "LLM '{ModelName}': {FileCount} arquivo(s) extraído(s) do JSON de resposta.",
+            ModelName,
+            artifacts.Count);
+
+        return artifacts;
     }
 
     public Task<string> EvaluateErrorAsync(string payload, string generatedCode, string errorMessage, CancellationToken cancellationToken)
@@ -148,6 +174,15 @@ public sealed class GoogleAiStudioAdapter(
         request.Headers.TryAddWithoutValidation(ApiKeyHeaderName, _options.ApiKey);
 
         var apiResponse = await SendAsync(request, cancellationToken).ConfigureAwait(false);
+
+        // Log do LLM em UMA linha e com tamanho limitado: o corpo inteiro (código gerado, com quebras
+        // de linha e caracteres de controle) viraria "[blob data]" no journal do Linux e desapareceria
+        // do log. O tamanho completo continua registrado para o operador saber o que não foi mostrado.
+        _logger.LogInformation(
+            "Resposta do LLM '{ModelName}': {Length} caractere(s). Prévia: {Preview}",
+            ModelName,
+            apiResponse.Length,
+            BuildLogPreview(apiResponse));
 
         return ExtractPayload(apiResponse);
     }
@@ -284,9 +319,10 @@ public sealed class GoogleAiStudioAdapter(
     /// <param name="modelOutput">Texto saneado devolvido por <see cref="SendPromptAsync"/>.</param>
     /// <returns>Artefatos por caminho relativo; dicionário vazio quando não houve payload algum.</returns>
     /// <exception cref="InvalidOperationException">
-    /// Quando há payload mas ele não é o objeto JSON de arquivos (chave string → valor string) ou
-    /// não traz nenhum arquivo. A exceção é a interface da falha para a mecânica de frustração: o
-    /// worker contabiliza a tentativa e escala o circuito para o modelo mais robusto no limite.
+    /// Quando há payload mas ele não é o objeto JSON de arquivos (chave string → valor string), não
+    /// traz nenhum arquivo ou não traz nenhum caminho utilizável no repositório. A exceção é a
+    /// interface da falha para a mecânica de frustração: o worker contabiliza a tentativa e escala o
+    /// circuito para o modelo mais robusto no limite.
     /// </exception>
     private static Dictionary<string, string> ExtractFileArtifacts(string modelOutput)
     {
@@ -296,22 +332,30 @@ public sealed class GoogleAiStudioAdapter(
             return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }
 
+        // Modelos entregam o objeto cercado por crases de markdown (```json ... ```): a sanitização
+        // remove a marcação antes de o JsonSerializer receber a string — sem ela o parse falharia e a
+        // tarefa seguiria como "resposta não parseável" mesmo com o JSON correto dentro do bloco.
+        var sanitized = AiStudioResponseReader.SanitizeJsonPayload(modelOutput);
+
         Dictionary<string, string>? files;
 
         try
         {
-            files = JsonSerializer.Deserialize<Dictionary<string, string>>(modelOutput, ResponseSerializerOptions);
+            files = JsonSerializer.Deserialize<Dictionary<string, string>>(sanitized, ResponseSerializerOptions);
         }
         catch (JsonException ex)
         {
             throw new InvalidOperationException(
-                "O modelo não devolveu o JSON estrito de arquivos esperado ({\"caminho/do/arquivo.cs\": \"conteúdo\"}).",
+                $"O modelo não devolveu o JSON estrito de arquivos esperado ({{\"caminho/do/arquivo.cs\": \"conteúdo\"}}). Prévia da resposta: {BuildLogPreview(sanitized)}",
                 ex);
         }
 
         if (files is null || files.Count == 0)
         {
-            throw new InvalidOperationException("O JSON devolvido pelo modelo não contém nenhum arquivo.");
+            // Erro explícito (e não retorno vazio): a tarefa precisa cair no tratamento de falha do
+            // worker com o motivo no log, em vez de seguir para o commit sem nada a versionar.
+            throw new InvalidOperationException(
+                $"O JSON devolvido pelo modelo não contém nenhum arquivo. Prévia da resposta: {BuildLogPreview(sanitized)}");
         }
 
         var artifacts = new Dictionary<string, string>(files.Count, StringComparer.OrdinalIgnoreCase);
@@ -329,7 +373,39 @@ public sealed class GoogleAiStudioAdapter(
             artifacts[path] = file.Value;
         }
 
+        if (artifacts.Count == 0)
+        {
+            // JSON desserializado, porém sem nenhum caminho publicável: falha explícita — o retorno
+            // vazio silencioso é o que deixava a branch criada sem commit e o PR sem abrir.
+            throw new InvalidOperationException(
+                $"Nenhum dos {files.Count} caminho(s) devolvido(s) pelo modelo é utilizável no repositório. Prévia da resposta: {BuildLogPreview(sanitized)}");
+        }
+
         return artifacts;
+    }
+
+    /// <summary>
+    /// Prepara um trecho de texto para log em uma única linha: colapsa quebras de linha e caracteres
+    /// de controle, compacta a indentação e limita o tamanho. Sem isso, o corpo gigante devolvido pelo
+    /// LLM é omitido pelo journal do Linux (<c>[blob data]</c>) e o debug fica sem a evidência do
+    /// payload recebido.
+    /// </summary>
+    /// <param name="text">Texto a resumir (resposta bruta do modelo ou payload já sanitizado).</param>
+    /// <param name="maxLength">Tamanho máximo da prévia (default <see cref="LogPreviewLength"/>).</param>
+    /// <returns>Prévia de uma linha; string vazia quando não há texto.</returns>
+    private static string BuildLogPreview(string text, int maxLength = LogPreviewLength)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return string.Empty;
+        }
+
+        var flattened = ControlCharacterRegex.Replace(text, " ");
+        flattened = WhitespaceRunRegex.Replace(flattened, " ").Trim();
+
+        return flattened.Length <= maxLength
+            ? flattened
+            : flattened[..maxLength] + "...";
     }
 
     /// <summary>

@@ -78,41 +78,65 @@ public sealed class GitHubAdapter : IGitHubService
         EnsureRepositoryConfiguration();
         ArgumentException.ThrowIfNullOrWhiteSpace(branchName);
 
-        // Ponto de partida: o commit mais recente da branch base configurada (GitHubOptions.BaseBranch).
-        var baseReference = await Client.Git.Reference
-            .Get(_options.Owner, _options.Repository, HeadRefPrefix + _options.BaseBranch)
-            .ConfigureAwait(false);
-
-        var newReference = new NewReference(BranchRefPrefix + branchName, baseReference.Object.Sha);
-
         try
         {
-            var createdReference = await Client.Git.Reference
-                .Create(_options.Owner, _options.Repository, newReference)
+            // Ponto de partida: o commit mais recente da branch base configurada (GitHubOptions.BaseBranch).
+            var baseReference = await Client.Git.Reference
+                .Get(_options.Owner, _options.Repository, HeadRefPrefix + _options.BaseBranch)
                 .ConfigureAwait(false);
 
-            return createdReference.Ref;
-        }
-        catch (ApiValidationException)
-        {
-            // Idempotência: a API responde 422 quando a referência já existe — cenário esperado ao
-            // reprocessar uma tarefa (ex.: desligamento entre o commit e a abertura do PR). A branch
-            // existente já é o ponto de partida válido, então o fluxo segue como se a tivéssemos criado.
-            var existingReference = await TryGetBranchReferenceAsync(branchName).ConfigureAwait(false);
+            var newReference = new NewReference(BranchRefPrefix + branchName, baseReference.Object.Sha);
 
-            if (existingReference is null)
+            try
             {
-                // 422 por outro motivo (nome inválido, permissão, repositório protegido): propaga.
-                throw;
-            }
+                var createdReference = await Client.Git.Reference
+                    .Create(_options.Owner, _options.Repository, newReference)
+                    .ConfigureAwait(false);
 
-            _logger.LogInformation(
-                "Branch '{Branch}' já existia em {Owner}/{Repository}; seguindo com a referência existente.",
+                _logger.LogInformation(
+                    "Branch '{Branch}' criada em {Owner}/{Repository} a partir de '{BaseBranch}' ({BaseSha}).",
+                    branchName,
+                    _options.Owner,
+                    _options.Repository,
+                    _options.BaseBranch,
+                    baseReference.Object.Sha);
+
+                return createdReference.Ref;
+            }
+            catch (ApiValidationException)
+            {
+                // Idempotência: a API responde 422 quando a referência já existe — cenário esperado ao
+                // reprocessar uma tarefa (ex.: desligamento entre o commit e a abertura do PR). A branch
+                // existente já é o ponto de partida válido, então o fluxo segue como se a tivéssemos criado.
+                var existingReference = await TryGetBranchReferenceAsync(branchName).ConfigureAwait(false);
+
+                if (existingReference is null)
+                {
+                    // 422 por outro motivo (nome inválido, permissão, repositório protegido): propaga.
+                    throw;
+                }
+
+                _logger.LogInformation(
+                    "Branch '{Branch}' já existia em {Owner}/{Repository}; seguindo com a referência existente.",
+                    branchName,
+                    _options.Owner,
+                    _options.Repository);
+
+                return existingReference.Ref;
+            }
+        }
+        catch (Exception ex)
+        {
+            // Fim do silêncio: nenhuma exceção do Octokit é engolida — o erro é logado aqui e propaga
+            // para o worker, que marca a tarefa como Falhou e alimenta a memória de frustração.
+            _logger.LogError(
+                ex,
+                "Falha ao criar/recuperar a branch '{Branch}' em {Owner}/{Repository}.",
                 branchName,
                 _options.Owner,
                 _options.Repository);
 
-            return existingReference.Ref;
+            throw;
         }
     }
 
@@ -148,63 +172,100 @@ public sealed class GitHubAdapter : IGitHubService
         ArgumentException.ThrowIfNullOrWhiteSpace(commitMessage);
         ArgumentNullException.ThrowIfNull(fileContents);
 
-        var owner = _options.Owner;
-        var repository = _options.Repository;
-        var headReference = HeadRefPrefix + branchName;
-
-        // Commit atual: a árvore dele é a base do diff e ele se torna o pai do novo commit.
-        var currentCommit = await Client.Git.Commit
-            .Get(owner, repository, headReference)
-            .ConfigureAwait(false);
-
-        var treeItems = new List<NewTreeItem>(fileContents.Count);
-
-        foreach (var file in fileContents)
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            if (fileContents.Count == 0)
+            {
+                // Commit sem arquivo é a falha silenciosa clássica: a branch ficaria idêntica à base e o
+                // pull request sairia vazio. Aqui isso é erro explícito, logado e propagado.
+                throw new InvalidOperationException(
+                    $"Commit da branch '{branchName}' sem nenhum arquivo: nada a versionar.");
+            }
 
-            var blob = await Client.Git.Blob
-                .Create(owner, repository, new NewBlob
-                {
-                    Content = file.Value,
-                    Encoding = EncodingType.Utf8
-                })
+            var owner = _options.Owner;
+            var repository = _options.Repository;
+            var headReference = HeadRefPrefix + branchName;
+
+            // Commit atual: a árvore dele é a base do diff e ele se torna o pai do novo commit.
+            var currentCommit = await Client.Git.Commit
+                .Get(owner, repository, headReference)
                 .ConfigureAwait(false);
 
-            treeItems.Add(new NewTreeItem
+            var treeItems = new List<NewTreeItem>(fileContents.Count);
+
+            foreach (var file in fileContents)
             {
-                Path = file.Key,
-                Mode = FileMode,
-                Type = TreeType.Blob,
-                Sha = blob.Sha
-            });
-        }
+                cancellationToken.ThrowIfCancellationRequested();
 
-        // A BaseTree preserva todo o conteúdo já versionado e aplica somente as alterações acima.
-        // No Octokit 14 a coleção NewTree.Tree é somente leitura e já vem inicializada.
-        var newTree = new NewTree { BaseTree = currentCommit.Tree.Sha };
+                var blob = await Client.Git.Blob
+                    .Create(owner, repository, new NewBlob
+                    {
+                        Content = file.Value,
+                        Encoding = EncodingType.Utf8
+                    })
+                    .ConfigureAwait(false);
 
-        foreach (var treeItem in treeItems)
-        {
-            newTree.Tree.Add(treeItem);
-        }
+                treeItems.Add(new NewTreeItem
+                {
+                    Path = file.Key,
+                    Mode = FileMode,
+                    Type = TreeType.Blob,
+                    Sha = blob.Sha
+                });
+            }
 
-        var createdTree = await Client.Git.Tree
-            .Create(owner, repository, newTree)
-            .ConfigureAwait(false);
+            // A BaseTree preserva todo o conteúdo já versionado e aplica somente as alterações acima.
+            // No Octokit 14 a coleção NewTree.Tree é somente leitura e já vem inicializada.
+            var newTree = new NewTree { BaseTree = currentCommit.Tree.Sha };
 
-        var newCommit = await Client.Git.Commit
-            .Create(owner, repository, new NewCommit(
-                commitMessage,
+            foreach (var treeItem in treeItems)
+            {
+                newTree.Tree.Add(treeItem);
+            }
+
+            var createdTree = await Client.Git.Tree
+                .Create(owner, repository, newTree)
+                .ConfigureAwait(false);
+
+            var newCommit = await Client.Git.Commit
+                .Create(owner, repository, new NewCommit(
+                    commitMessage,
+                    createdTree.Sha,
+                    currentCommit.Parents.Select(parent => parent.Sha)))
+                .ConfigureAwait(false);
+
+            await Client.Git.Reference
+                .Update(owner, repository, headReference, new ReferenceUpdate(newCommit.Sha))
+                .ConfigureAwait(false);
+
+            // Auditoria da entrega: blobs, árvore e commit com o SHA de cada etapa ficam no log — é
+            // este rastro que mostra onde o fluxo parou quando a branch é criada e nada é commitado.
+            _logger.LogInformation(
+                "Commit {CommitSha} publicado na branch '{Branch}' de {Owner}/{Repository}: {FileCount} arquivo(s), árvore {TreeSha} (base {BaseTreeSha}).",
+                newCommit.Sha,
+                branchName,
+                owner,
+                repository,
+                fileContents.Count,
                 createdTree.Sha,
-                currentCommit.Parents.Select(parent => parent.Sha)))
-            .ConfigureAwait(false);
+                currentCommit.Tree.Sha);
 
-        await Client.Git.Reference
-            .Update(owner, repository, headReference, new ReferenceUpdate(newCommit.Sha))
-            .ConfigureAwait(false);
+            return newCommit.Sha;
+        }
+        catch (Exception ex)
+        {
+            // Nada é engolido: o erro do Octokit é logado antes de propagar, para o worker marcar a
+            // tarefa como Falhou (e alimentar a memória de frustração do overdrive).
+            _logger.LogError(
+                ex,
+                "Falha no commit de {FileCount} arquivo(s) na branch '{Branch}' de {Owner}/{Repository}.",
+                fileContents.Count,
+                branchName,
+                _options.Owner,
+                _options.Repository);
 
-        return newCommit.Sha;
+            throw;
+        }
     }
 
     /// <inheritdoc />
@@ -221,40 +282,63 @@ public sealed class GitHubAdapter : IGitHubService
         ArgumentException.ThrowIfNullOrWhiteSpace(branchName);
         ArgumentException.ThrowIfNullOrWhiteSpace(title);
 
-        var newPullRequest = new NewPullRequest(title, branchName, _options.BaseBranch)
-        {
-            Body = description
-        };
-
         try
         {
-            var pullRequest = await Client.PullRequest
-                .Create(_options.Owner, _options.Repository, newPullRequest)
-                .ConfigureAwait(false);
-
-            return pullRequest.HtmlUrl;
-        }
-        catch (ApiValidationException)
-        {
-            // Idempotência: a API responde 422 quando já existe pull request aberto para a mesma
-            // branch (retrabalho da tarefa). O PR existente é o resultado esperado da operação, então
-            // a URL dele é devolvida em vez de falhar a entrega já commitada.
-            var existingPullRequest = await FindOpenPullRequestAsync(branchName).ConfigureAwait(false);
-
-            if (existingPullRequest is null)
+            var newPullRequest = new NewPullRequest(title, branchName, _options.BaseBranch)
             {
-                // 422 por outro motivo (branch igual à base, título inválido, PR de fork): propaga.
-                throw;
-            }
+                Body = description
+            };
 
-            _logger.LogInformation(
-                "Pull request da branch '{Branch}' já estava aberto em {Owner}/{Repository}; reutilizando {PullRequestUrl}.",
+            try
+            {
+                var pullRequest = await Client.PullRequest
+                    .Create(_options.Owner, _options.Repository, newPullRequest)
+                    .ConfigureAwait(false);
+
+                _logger.LogInformation(
+                    "Pull request da branch '{Branch}' aberto em {Owner}/{Repository}: {PullRequestUrl}.",
+                    branchName,
+                    _options.Owner,
+                    _options.Repository,
+                    pullRequest.HtmlUrl);
+
+                return pullRequest.HtmlUrl;
+            }
+            catch (ApiValidationException)
+            {
+                // Idempotência: a API responde 422 quando já existe pull request aberto para a mesma
+                // branch (retrabalho da tarefa). O PR existente é o resultado esperado da operação, então
+                // a URL dele é devolvida em vez de falhar a entrega já commitada.
+                var existingPullRequest = await FindOpenPullRequestAsync(branchName).ConfigureAwait(false);
+
+                if (existingPullRequest is null)
+                {
+                    // 422 por outro motivo (branch igual à base, título inválido, PR de fork): propaga.
+                    throw;
+                }
+
+                _logger.LogInformation(
+                    "Pull request da branch '{Branch}' já estava aberto em {Owner}/{Repository}; reutilizando {PullRequestUrl}.",
+                    branchName,
+                    _options.Owner,
+                    _options.Repository,
+                    existingPullRequest.HtmlUrl);
+
+                return existingPullRequest.HtmlUrl;
+            }
+        }
+        catch (Exception ex)
+        {
+            // Nenhuma exceção do Octokit é engolida: o erro é logado antes de propagar — o commit
+            // (se houve) já está no repositório e o worker registra a tarefa como Falhou.
+            _logger.LogError(
+                ex,
+                "Falha ao abrir o pull request da branch '{Branch}' em {Owner}/{Repository}.",
                 branchName,
                 _options.Owner,
-                _options.Repository,
-                existingPullRequest.HtmlUrl);
+                _options.Repository);
 
-            return existingPullRequest.HtmlUrl;
+            throw;
         }
     }
 

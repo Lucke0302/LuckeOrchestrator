@@ -149,6 +149,8 @@ public static class DependencyInjectionSetup
     /// O tipo concreto é devolvido (em vez de <see cref="ILLMProvider"/>) porque o mesmo adapter
     /// atende às duas operações do AI Studio: geração de conteúdo (MoE) e embeddings (RAG) — o
     /// registro de <see cref="IEmbeddingProvider"/> reutiliza esta fábrica com o modelo de embeddings.
+    /// O logger é resolvido do container para que a auditoria do parse (contagem de arquivos e prévia
+    /// da resposta) apareça no log do host, e não em uma implementação silenciosa.
     /// </remarks>
     private static GoogleAiStudioAdapter CreateAiStudioExpert(IServiceProvider serviceProvider, string modelName)
     {
@@ -158,7 +160,8 @@ public static class DependencyInjectionSetup
         return new GoogleAiStudioAdapter(
             httpClient,
             Options.Create(template.ForModel(modelName)),
-            serviceProvider.GetRequiredService<IQuotaManager>());
+            serviceProvider.GetRequiredService<IQuotaManager>(),
+            serviceProvider.GetRequiredService<ILogger<GoogleAiStudioAdapter>>());
     }
 
     /// <summary>

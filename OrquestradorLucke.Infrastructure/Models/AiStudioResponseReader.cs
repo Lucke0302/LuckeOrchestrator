@@ -39,6 +39,25 @@ internal static class AiStudioResponseReader
         @"</?(?:start_of_turn|end_of_turn|eos|bos)>",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+    /// <summary>
+    /// Cerca de bloco markdown (crases ou tils) ocupando a linha inteira, com rótulo de linguagem
+    /// opcional — a forma como os modelos entregam o JSON: <c>```json</c> na primeira linha e
+    /// <c>```</c> na última.
+    /// </summary>
+    private static readonly Regex FenceLineRegex = new(
+        "^[ \t]*(?:`{3,}|~{3,})[ \t]*(?<label>[A-Za-z0-9_+.#-]*)[ \t]*$\r?\n?",
+        RegexOptions.Compiled | RegexOptions.Multiline);
+
+    /// <summary>Cerca remanescente colada ao payload, na mesma linha (ex.: <c>```json{"a":1}```</c>).</summary>
+    private static readonly Regex InlineFenceRegex = new(
+        @"(?:`{3,}|~{3,})",
+        RegexOptions.Compiled);
+
+    /// <summary>Rótulo <c>json</c>/<c>jsonc</c> colado no objeto, sem cerca alguma (ex.: <c>json {...}</c>).</summary>
+    private static readonly Regex LeadingJsonLabelRegex = new(
+        @"^\s*json\w*\s*:?\s*(?=[\{\[])",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
     /// <summary>Lê o envelope do AI Studio e devolve o texto produzido pelos candidatos.</summary>
     /// <param name="rawApiResponse">Corpo bruto devolvido pelo provedor.</param>
     /// <param name="modelOutput">
@@ -311,6 +330,65 @@ internal static class AiStudioResponseReader
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// Sanitiza o payload devolvido pelo LLM antes da desserialização: modelos entregam o JSON cercado
+    /// por crases triplas — por vezes rotuladas com <c>json</c> — ou com o rótulo colado no objeto, e o
+    /// desserializador só aceita a string bruta do objeto.
+    /// </summary>
+    /// <remarks>
+    /// A limpeza agressiva (remoção de cercas e do rótulo) só roda quando o texto <b>não</b> é JSON
+    /// válido: assim um valor de string que contenha crases legítimas (um trecho de markdown dentro do
+    /// arquivo gerado) nunca é mutilado. Quando nem isso resolve, devolve-se o primeiro trecho JSON
+    /// balanceado — o caso da cerca rotulada que veio com prosa dentro dela.
+    /// </remarks>
+    /// <param name="modelOutput">Saída do modelo (bruta ou já sem o raciocínio).</param>
+    /// <returns>Payload pronto para desserializar; string vazia quando não há texto.</returns>
+    public static string SanitizeJsonPayload(string modelOutput)
+    {
+        if (string.IsNullOrWhiteSpace(modelOutput))
+        {
+            return string.Empty;
+        }
+
+        var text = modelOutput.Trim();
+
+        if (IsJsonDocument(text))
+        {
+            // Já é JSON: nada a limpar — e nenhuma crase dentro de string é tocada.
+            return text;
+        }
+
+        var fenced = TryExtractFencedPayload(text);
+
+        if (!string.IsNullOrEmpty(fenced) && IsJsonDocument(fenced))
+        {
+            return fenced;
+        }
+
+        var stripped = StripFenceResidue(text);
+
+        if (IsJsonDocument(stripped))
+        {
+            return stripped;
+        }
+
+        return TryExtractBalancedJson(stripped) ?? stripped;
+    }
+
+    /// <summary>
+    /// Remove os resíduos de markdown do candidato: cercas em linha própria (com o rótulo de
+    /// linguagem), cercas coladas no payload e o rótulo <c>json</c> solto antes do objeto.
+    /// </summary>
+    private static string StripFenceResidue(string text)
+    {
+        var stripped = FenceLineRegex.Replace(text, string.Empty);
+
+        stripped = InlineFenceRegex.Replace(stripped, string.Empty);
+        stripped = LeadingJsonLabelRegex.Replace(stripped, string.Empty);
+
+        return stripped.Trim();
     }
 
     /// <summary>

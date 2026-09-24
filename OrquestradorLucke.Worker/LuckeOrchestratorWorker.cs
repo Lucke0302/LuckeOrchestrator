@@ -170,54 +170,86 @@ public sealed class LuckeOrchestratorWorker(
                 // Braços (GitHub): branch de trabalho, commit dos arquivos gerados e pull request.
                 var branchName = $"{BranchNamePrefix}{task.Id}";
 
-                await gitHubService.CreateBranchAsync(branchName, stoppingToken).ConfigureAwait(false);
-
-                // O expert devolve um JSON caminho → conteúdo: o dicionário segue direto para o commit,
-                // sem caminho de artefato fixo (uma tarefa pode entregar quantos arquivos precisar).
-                await gitHubService
-                    .CommitChangesAsync(
-                        branchName,
-                        $"feat(task-{task.Id}): entrega automática do orquestrador",
-                        artifacts,
-                        stoppingToken)
-                    .ConfigureAwait(false);
-
-                // Descrição do PR: sumarizada por um expert rápido a partir da tarefa e dos artefatos.
-                var pullRequestDescription = await BuildPullRequestSummaryAsync(
-                        taskRouter,
-                        task,
-                        artifacts,
-                        stoppingToken)
-                    .ConfigureAwait(false);
-
-                var pullRequestUrl = await gitHubService
-                    .OpenPullRequestAsync(
-                        branchName,
-                        $"feat(task-{task.Id})",
-                        pullRequestDescription,
-                        stoppingToken)
-                    .ConfigureAwait(false);
-
-                frustrationTracker.RegistrarSucesso();
-
-                // AgentTask é um record imutável: o estado final é derivado por "with".
-                var concludedTask = task with
-                {
-                    Status = AgentTaskStatus.Concluida,
-                    AtualizadoEm = DateTimeOffset.UtcNow,
-                    Branch = branchName,
-                    PullRequestUrl = pullRequestUrl
-                };
-
-                await taskRepository.UpdateTaskAsync(concludedTask, stoppingToken).ConfigureAwait(false);
-
                 logger.LogInformation(
-                    "Tarefa {TaskId} concluída na branch '{Branch}' pelo expert '{ModelName}' ({FileCount} arquivo(s)). Pull request: {PullRequestUrl}.",
+                    "Entrega da tarefa {TaskId}: criando a branch '{Branch}' com {FileCount} arquivo(s) do expert '{ModelName}'.",
                     task.Id,
                     branchName,
-                    provider.ModelName,
                     artifacts.Count,
-                    pullRequestUrl);
+                    provider.ModelName);
+
+                try
+                {
+                    await gitHubService.CreateBranchAsync(branchName, stoppingToken).ConfigureAwait(false);
+
+                    // O expert devolve um JSON caminho → conteúdo: o dicionário segue direto para o commit,
+                    // sem caminho de artefato fixo (uma tarefa pode entregar quantos arquivos precisar).
+                    await gitHubService
+                        .CommitChangesAsync(
+                            branchName,
+                            $"feat(task-{task.Id}): entrega automática do orquestrador",
+                            artifacts,
+                            stoppingToken)
+                        .ConfigureAwait(false);
+
+                    // Descrição do PR: sumarizada por um expert rápido a partir da tarefa e dos artefatos.
+                    var pullRequestDescription = await BuildPullRequestSummaryAsync(
+                            taskRouter,
+                            task,
+                            artifacts,
+                            stoppingToken)
+                        .ConfigureAwait(false);
+
+                    var pullRequestUrl = await gitHubService
+                        .OpenPullRequestAsync(
+                            branchName,
+                            $"feat(task-{task.Id})",
+                            pullRequestDescription,
+                            stoppingToken)
+                        .ConfigureAwait(false);
+
+                    frustrationTracker.RegistrarSucesso();
+
+                    // AgentTask é um record imutável: o estado final é derivado por "with".
+                    var concludedTask = task with
+                    {
+                        Status = AgentTaskStatus.Concluida,
+                        AtualizadoEm = DateTimeOffset.UtcNow,
+                        Branch = branchName,
+                        PullRequestUrl = pullRequestUrl
+                    };
+
+                    await taskRepository.UpdateTaskAsync(concludedTask, stoppingToken).ConfigureAwait(false);
+
+                    logger.LogInformation(
+                        "Tarefa {TaskId} concluída na branch '{Branch}' pelo expert '{ModelName}' ({FileCount} arquivo(s)). Pull request: {PullRequestUrl}.",
+                        task.Id,
+                        branchName,
+                        provider.ModelName,
+                        artifacts.Count,
+                        pullRequestUrl);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    // Desligamento do host no meio da entrega: o catch do laço devolve a tarefa à fila.
+                    throw;
+                }
+                catch (QuotaExhaustedException)
+                {
+                    // Cota do expert de sumarização: tratamento do laço (cooldown + devolução à fila).
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // Fim do silêncio: nenhuma falha do GitHub é engolida. O erro é logado, alimenta a
+                    // memória de frustração (histórico entregue ao overdrive) e a tarefa é marcada como
+                    // Falhou — a branch eventualmente criada permanece no repositório para auditoria.
+                    RegisterDeliveryFailure(provider, task, frustrationTracker, branchName, ex);
+
+                    await UpdateStatusAsync(taskRepository, task, AgentTaskStatus.Falhou, stoppingToken)
+                        .ConfigureAwait(false);
+
+                    continue;
+                }
             }
             catch (QuotaExhaustedException ex)
             {
@@ -290,14 +322,26 @@ public sealed class LuckeOrchestratorWorker(
                 .GenerateCodeAsync(task.Payload, contextAnalysis, stoppingToken)
                 .ConfigureAwait(false);
 
-            if (!ContainsArtifacts(artifacts))
-            {
-                RegisterGenerationFailure(provider, task, frustrationTracker, "retorno sem arquivos");
+            // Auditoria do parse: quantos arquivos sobreviveram à desserialização do JSON do LLM — e
+            // quantos têm conteúdo de fato. O número entra no log antes de qualquer efeito no GitHub.
+            var deliverable = SelectDeliverableArtifacts(artifacts);
 
-                return null;
+            logger.LogInformation(
+                "Parse do expert '{ModelName}' na tarefa {TaskId}: {Usable} de {Total} arquivo(s) aproveitável(is).",
+                provider.ModelName,
+                task.Id,
+                deliverable.Count,
+                artifacts.Count);
+
+            if (deliverable.Count == 0)
+            {
+                // Erro explícito (em vez de retorno vazio silencioso): cai no catch abaixo, alimenta a
+                // memória de frustração e a tarefa termina como Falhou — após o overdrive, se disparar.
+                throw new InvalidOperationException(
+                    $"O expert '{provider.ModelName}' não devolveu nenhum arquivo com conteúdo para a tarefa {task.Id}.");
             }
 
-            return artifacts;
+            return deliverable;
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
@@ -319,9 +363,27 @@ public sealed class LuckeOrchestratorWorker(
         }
     }
 
-    /// <summary>Indica se o retorno do expert traz ao menos um arquivo com conteúdo utilizável.</summary>
-    private static bool ContainsArtifacts(IReadOnlyDictionary<string, string>? artifacts)
-        => artifacts is not null && artifacts.Any(file => !string.IsNullOrWhiteSpace(file.Value));
+    /// <summary>
+    /// Filtra o retorno do expert antes da entrega: só entram no commit os arquivos com caminho e
+    /// conteúdo reais. Entrada em branco geraria arquivo vazio no repositório (e poluiria o diff do
+    /// pull request), então o parse devolve apenas o que é publicável — e zero arquivos é falha.
+    /// </summary>
+    private static Dictionary<string, string> SelectDeliverableArtifacts(IReadOnlyDictionary<string, string> artifacts)
+    {
+        var deliverable = new Dictionary<string, string>(artifacts.Count, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var artifact in artifacts)
+        {
+            if (string.IsNullOrWhiteSpace(artifact.Key) || string.IsNullOrWhiteSpace(artifact.Value))
+            {
+                continue;
+            }
+
+            deliverable[artifact.Key] = artifact.Value;
+        }
+
+        return deliverable;
+    }
 
     /// <summary>
     /// Incrementa o medidor de frustração e registra a falha da tentativa, informando se o circuito
@@ -348,6 +410,39 @@ public sealed class LuckeOrchestratorWorker(
             provider.ModelName,
             task.Id,
             reason,
+            frustrationTracker.ContadorAtual,
+            frustrationTracker.LimiteMaximo,
+            overdriveTriggered);
+    }
+
+    /// <summary>
+    /// Contabiliza uma falha de <b>entrega</b> no GitHub (branch, commit ou pull request): registra o
+    /// erro no log, alimenta a memória de frustração com o passo que falhou e deixa a decisão de
+    /// status para o chamador — a tarefa segue para <c>Falhou</c> em vez de desaparecer sem entrega.
+    /// </summary>
+    /// <remarks>
+    /// O motivo entra no <see cref="FrustrationTracker"/> pela mesma porta das falhas de geração, para
+    /// o overdrive receber o histórico completo quando o circuito desarmar. A entrega não é repetida no
+    /// mesmo ciclo: os artefatos já foram gerados e o problema é do repositório, não do modelo.
+    /// </remarks>
+    private void RegisterDeliveryFailure(
+        ILLMProvider provider,
+        AgentTask task,
+        FrustrationTracker frustrationTracker,
+        string branchName,
+        Exception exception)
+    {
+        var failure =
+            $"{provider.ModelName}: falha de entrega no GitHub na branch '{branchName}' ({exception.GetType().Name}: {exception.Message})";
+
+        var overdriveTriggered = frustrationTracker.RegistrarFalha(failure);
+
+        logger.LogError(
+            exception,
+            "Falha de entrega no GitHub para a tarefa {TaskId} na branch '{Branch}' (expert '{ModelName}'): falha {Falhas}/{Limite} (overdrive: {Overdrive}).",
+            task.Id,
+            branchName,
+            provider.ModelName,
             frustrationTracker.ContadorAtual,
             frustrationTracker.LimiteMaximo,
             overdriveTriggered);

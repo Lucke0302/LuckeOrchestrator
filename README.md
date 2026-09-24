@@ -91,7 +91,7 @@ OrquestradorLucke.Worker          → DI, IOptions e BackgroundService (host do 
 | **Application** | Contratos e orquestração de caso de uso | `IAgentTaskRepository`, `ILLMProvider`, `IEmbeddingProvider`, `ICodeContextRepository`, `IGitHubService`, `ITaskRouter`, `IQuotaManager`, `CodebaseIndexerService` |
 | **Infrastructure** | Implementações reais | `AppDbContext` (+ migrations), `AgentTaskRepository`, `CodeContextRepository`, `GoogleAiStudioAdapter`, `GitHubAdapter`, `MoETaskRouter`, `DbQuotaManager`, `ModelCatalog` |
 | **Worker** | Composição e laço do daemon | `Program` (host HTTP + webhook), `DependencyInjectionSetup`, `LuckeOrchestratorWorker`, `OrchestratorWorkerOptions`, `IndexingChannel`, `IndexingBackgroundService` |
-| **Tests** | Testes automatizados (xUnit + Moq + FluentAssertions) | `MoETaskRouterTests`, `FrustrationTrackerTests`, `CodebaseIndexerServiceTests`, `OrchestratorCompositionTests` |
+| **Tests** | Testes automatizados (xUnit + Moq + FluentAssertions) | `MoETaskRouterTests`, `FrustrationTrackerTests`, `CodebaseIndexerServiceTests`, `OrchestratorCompositionTests`, `GoogleAiStudioAdapterEmbeddingTests`, `GoogleAiStudioAdapterParseTests`, `LuckeOrchestratorWorkerDeliveryTests` |
 
 Regras respeitadas no código:
 
@@ -145,9 +145,9 @@ complexidade e a dimensão dos vetores de embedding.
   (purge oportunista) e a janela mais longa é preservada em bloqueios repetidos.
 - `InMemoryQuotaManager` continua no projeto como implementação em memória usada pelos testes
   unitários de roteamento (sem banco).
-- `FrustrationTracker` (Domain) contabiliza as falhas de geração do daemon e marca
-  `OverdriveDisparado` ao atingir `Frustration:MaxFailures` — é o gatilho do overdrive descrito
-  abaixo.
+- `FrustrationTracker` (Domain) contabiliza as falhas do daemon — de geração **e** de entrega no
+  GitHub — e marca `OverdriveDisparado` ao atingir `Frustration:MaxFailures` — é o gatilho do
+  overdrive descrito abaixo.
 - Política Polly (`HttpResilience`): retry com backoff exponencial para 5xx/408 e
   `HttpRequestException`; 400/401/403/404 falham sem retry.
 
@@ -164,6 +164,12 @@ A mecânica de frustração é o que impede o daemon de insistir em um expert qu
    robusto com `ITaskRouter.ResolveOverdriveProvider()` (cadeia `Critico`, com o fallback interno
    dela) e faz **uma última tentativa** de geração;
 4. só se essa tentativa também falhar a tarefa é marcada como `Falhou`.
+
+Falhas de **entrega** (criar branch, commit de blob/tree, abertura do PR) entram na mesma memória: o
+`GitHubAdapter` loga o erro (`LogError`, com o passo que falhou) e **propaga** a exceção — o worker
+registra o motivo no `FrustrationTracker`, marca a tarefa como `Falhou` e segue o laço. A entrega não é
+repetida no mesmo ciclo (os artefatos já foram gerados e o problema é do repositório, não do modelo), e
+**nenhuma exceção do Octokit é engolida**: branch criada sem commit deixa de ser um "sucesso" silencioso.
 
 ### Memória da frustração (o que o modelo maior recebe)
 
@@ -344,6 +350,26 @@ A resposta vira o corpo (*body*) do pull request. Se o sumarizador falhar (cota,
 vazio ou devolver algo que não é o JSON esperado, o PR usa a descrição determinística (`Entrega
 automática da tarefa …` + payload): a entrega já commitada não é desfeita por causa do resumo.
 
+## Auditoria do parse e da entrega (fim do silêncio)
+
+- **Sanitização do JSON:** antes de desserializar, o payload do LLM passa por
+  `AiStudioResponseReader.SanitizeJsonPayload`, que remove cercas de markdown (` ```json ... ``` `,
+  inclusive coladas no objeto e com prosa dentro do bloco) e o rótulo `json`. A limpeza só roda quando
+  o texto **não** é JSON válido, então crases legítimas dentro de um valor de string chegam intactas ao
+  commit.
+- **Log do LLM em uma linha:** a resposta é registrada com o tamanho total e uma prévia de **200
+  caracteres** sem quebras de linha — o corpo multilinha gigante vira `[blob data]` no journal do Linux
+  e desaparecia do log.
+- **Auditoria do parse:** o número de arquivos extraídos (e quantos são aproveitáveis) é logado antes
+  de qualquer efeito no GitHub; JSON válido porém sem nenhum arquivo/caminho utilizável lança
+  `InvalidOperationException` — a tarefa cai no tratamento de falha (frustração → overdrive → `Falhou`)
+  em vez de seguir para um commit vazio.
+- **Commit sem arquivos é erro:** `CommitChangesAsync` recusa um commit vazio de forma explícita (seria
+  a branch idêntica à base e o PR vazio).
+- **Trilha do Octokit:** criação de branch, commit (blobs, árvore, referência) e abertura do PR logam
+  `LogInformation` com os SHAs/caminhos de cada etapa e `LogError` + rethrow em qualquer falha — o log
+  mostra exatamente onde o fluxo parou.
+
 ## Fila e ciclo de vida da tarefa
 
 | Status | Significado |
@@ -351,7 +377,7 @@ automática da tarefa …` + payload): a entrega já commitada não é desfeita 
 | `Pendente` | na fila, aguardando dequeue |
 | `EmExecucao` | reivindicada pelo worker (o dequeue já grava esse status) |
 | `Concluida` | arquivos commitados e PR aberto; `Branch` e `PullRequestUrl` preenchidos |
-| `Falhou` | geração sem arquivos, resposta fora do JSON estrito ou falha não recuperável (após a tentativa do overdrive, quando disparado) |
+| `Falhou` | geração sem arquivos, resposta fora do JSON estrito, falha não recuperável (após a tentativa do overdrive, quando disparado) ou falha de entrega no GitHub (branch/commit/PR) |
 | `Cancelada` | interrompida por solicitação/desligamento |
 
 O índice `ix_agent_tasks_status_criado_em` (`status`, `criado_em`) atende exatamente o dequeue:
@@ -581,7 +607,14 @@ Os demais testes cobrem as melhorias arquiteturais:
   em árvore vazia;
 - `OrchestratorCompositionTests` — executa a mesma validação de DI que o host faz no start
   (`ValidateOnBuild`/`ValidateScopes`) sobre a composição real, além de fixar os tempos de vida de
-  `DbQuotaManager` (Scoped) e `IndexingChannel` (Singleton) e o fail fast da connection string.
+  `DbQuotaManager` (Scoped) e `IndexingChannel` (Singleton) e o fail fast da connection string;
+- `GoogleAiStudioAdapterParseTests` — o JSON cercado por crases/alvo de markdown é sanitizado antes da
+  desserialização (cercas em linha própria, coladas no objeto, rótulo `json` solto e cerca com prosa),
+  crases legítimas dentro de um valor de string não são mutadas, o retorno sem arquivo utilizável falha
+  com `InvalidOperationException` e a resposta do LLM é logada em uma única linha truncada;
+- `LuckeOrchestratorWorkerDeliveryTests` — falha no commit do GitHub não é engolida: a tarefa é gravada
+  como `Falhou`, um único `LogError` traz o passo que falhou e o contador da frustração (1/3), nenhum PR
+  é aberto e a tarefa não é marcada como `Concluida`.
 
 ## Limitações e próximos passos
 
