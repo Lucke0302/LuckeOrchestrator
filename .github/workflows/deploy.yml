@@ -21,3 +21,6 @@ jobs:
       
     - name: Restart Systemd Service
       run: sudo systemctl restart lucke-orchestrator.service
+    
+    - name: Reiniciar serviço do Orquestrador
+      run: sudo systemctl restart lucke-orchestrator.service
