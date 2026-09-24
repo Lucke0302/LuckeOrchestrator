@@ -4,6 +4,8 @@ using OrquestradorLucke.Application.Interfaces;
 using OrquestradorLucke.Domain;
 using OrquestradorLucke.Infrastructure.Adapters;
 using OrquestradorLucke.Infrastructure.Configuration;
+using OrquestradorLucke.Infrastructure.Data;
+using OrquestradorLucke.Infrastructure.Data.Repositories;
 using OrquestradorLucke.Infrastructure.Quota;
 using OrquestradorLucke.Worker.Configuration;
 using Polly;
@@ -11,8 +13,9 @@ using Polly;
 namespace OrquestradorLucke.Worker;
 
 /// <summary>
-/// Composição da injeção de dependência do host: bind dos IOptions, um expert do Google AI Studio
-/// por modelo do catálogo MoE, Circuit Breaker de cota e política de resiliência (Polly).
+/// Composição da injeção de dependência do host: bind dos IOptions, persistência PostgreSQL
+/// (EF Core + Npgsql + pgvector), um expert do Google AI Studio por modelo do catálogo MoE,
+/// Circuit Breaker de cota e política de resiliência (Polly).
 /// </summary>
 public static class DependencyInjectionSetup
 {
@@ -31,6 +34,19 @@ public static class DependencyInjectionSetup
         services.Configure<FrustrationSettings>(configuration.GetSection(FrustrationSettings.SectionName));
         services.Configure<OrchestratorWorkerOptions>(configuration.GetSection(OrchestratorWorkerOptions.SectionName));
 
+        // Persistência: a connection string vem da configuração (user-secrets/variável de ambiente) e o
+        // EF Core (Npgsql + pgvector) é registrado pela Infrastructure, que é a única camada que o conhece.
+        var connectionString = configuration.GetConnectionString(AppDbContext.ConnectionStringName);
+
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            throw new InvalidOperationException(
+                $"ConnectionStrings:{AppDbContext.ConnectionStringName} não configurada. " +
+                $"Defina via user-secrets ou variável de ambiente (ConnectionStrings__{AppDbContext.ConnectionStringName}).");
+        }
+
+        services.AddPostgresPersistence(connectionString);
+
         // Circuit Breaker de cota: estado único e compartilhado por todo o host.
         services.AddSingleton<IQuotaManager, InMemoryQuotaManager>();
 
@@ -38,6 +54,7 @@ public static class DependencyInjectionSetup
 
         // Serviços resolvidos a cada iteração (escopo do laço do BackgroundService).
         services.AddScoped<IGitHubService, GitHubAdapter>();
+        services.AddScoped<IAgentTaskRepository, AgentTaskRepository>();
         services.AddScoped<ITaskRouter, MoETaskRouter>();
 
         return services;

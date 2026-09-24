@@ -1,0 +1,28 @@
+name: Deploy Orquestrador Lucke
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: self-hosted
+    
+    steps:
+    - name: Checkout do código
+      uses: actions/checkout@v4
+      
+    - name: Setup .NET 10
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+        
+    - name: Restore dependencies
+      run: dotnet restore
+      
+    - name: Build and Publish
+      run: dotnet publish OrquestradorLucke.Worker/OrquestradorLucke.Worker.csproj -c Release -o /var/opt/lucke-orchestrator --no-restore
+      
+    - name: Restart Systemd Service
+      run: sudo systemctl restart lucke-orchestrator.service
