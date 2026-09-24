@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="OrquestradorLucke.Application/OrquestradorLucke.Application.csproj" />
+  <Project Path="OrquestradorLucke.Domain/OrquestradorLucke.Domain.csproj" />
+  <Project Path="OrquestradorLucke.Infrastructure/OrquestradorLucke.Infrastructure.csproj" />
+  <Project Path="OrquestradorLucke.Worker/OrquestradorLucke.Worker.csproj" />
+</Solution>
