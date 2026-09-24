@@ -1,4 +1,5 @@
 using System.Text;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Octokit;
 using OrquestradorLucke.Application.Interfaces;
@@ -12,6 +13,11 @@ namespace OrquestradorLucke.Infrastructure.Adapters;
 /// montados como objetos e trafegam por HTTP, portanto nada é clonado, lido ou escrito no
 /// sistema de arquivos local.
 /// </summary>
+/// <remarks>
+/// As operações são idempotentes: reprocessar uma tarefa que já criou a branch ou o pull request
+/// reutiliza o recurso existente (a API do GitHub responde <c>422</c> nos dois casos) em vez de
+/// derrubar a entrega — cenário comum quando o daemon é reiniciado no meio do ciclo.
+/// </remarks>
 public sealed class GitHubAdapter : IGitHubService
 {
     /// <summary>Identificador do produto enviado no cabeçalho de agente das requisições ao GitHub.</summary>
@@ -30,17 +36,20 @@ public sealed class GitHubAdapter : IGitHubService
     private const string CSharpFileExtension = ".cs";
 
     private readonly GitHubOptions _options;
+    private readonly ILogger<GitHubAdapter> _logger;
 
     /// <summary>
     /// Cria o adapter e autentica o cliente Octokit. O token vem de <see cref="GitHubOptions"/>
     /// (user-secrets ou variável de ambiente) — nunca hardcoded.
     /// </summary>
     /// <exception cref="InvalidOperationException">Quando <see cref="GitHubOptions.Token"/> não está configurado.</exception>
-    public GitHubAdapter(IOptions<GitHubOptions> options)
+    public GitHubAdapter(IOptions<GitHubOptions> options, ILogger<GitHubAdapter> logger)
     {
         ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(logger);
 
         _options = options.Value;
+        _logger = logger;
 
         // Fail fast: sem token não há operação possível, e Credentials lançaria algo menos claro na primeira chamada.
         if (string.IsNullOrWhiteSpace(_options.Token))
@@ -59,7 +68,8 @@ public sealed class GitHubAdapter : IGitHubService
     /// <inheritdoc />
     /// <remarks>
     /// A versão 14 do Octokit não expõe overloads com <see cref="CancellationToken"/> nas rotas de
-    /// Git/pull request; por isso o token é validado no início da operação.
+    /// Git/pull request; por isso o token é validado no início da operação. A criação é idempotente:
+    /// branch já existente não é erro, é o ponto de retomada do ciclo (ver exceção tratada abaixo).
     /// </remarks>
     public async Task<string> CreateBranchAsync(string branchName, CancellationToken cancellationToken)
     {
@@ -75,11 +85,53 @@ public sealed class GitHubAdapter : IGitHubService
 
         var newReference = new NewReference(BranchRefPrefix + branchName, baseReference.Object.Sha);
 
-        var createdReference = await Client.Git.Reference
-            .Create(_options.Owner, _options.Repository, newReference)
-            .ConfigureAwait(false);
+        try
+        {
+            var createdReference = await Client.Git.Reference
+                .Create(_options.Owner, _options.Repository, newReference)
+                .ConfigureAwait(false);
 
-        return createdReference.Ref;
+            return createdReference.Ref;
+        }
+        catch (ApiValidationException)
+        {
+            // Idempotência: a API responde 422 quando a referência já existe — cenário esperado ao
+            // reprocessar uma tarefa (ex.: desligamento entre o commit e a abertura do PR). A branch
+            // existente já é o ponto de partida válido, então o fluxo segue como se a tivéssemos criado.
+            var existingReference = await TryGetBranchReferenceAsync(branchName).ConfigureAwait(false);
+
+            if (existingReference is null)
+            {
+                // 422 por outro motivo (nome inválido, permissão, repositório protegido): propaga.
+                throw;
+            }
+
+            _logger.LogInformation(
+                "Branch '{Branch}' já existia em {Owner}/{Repository}; seguindo com a referência existente.",
+                branchName,
+                _options.Owner,
+                _options.Repository);
+
+            return existingReference.Ref;
+        }
+    }
+
+    /// <summary>
+    /// Lê a referência de uma branch do repositório, devolvendo <c>null</c> quando ela não existe —
+    /// o retorno esperado da checagem de idempotência, e não uma falha.
+    /// </summary>
+    private async Task<Reference?> TryGetBranchReferenceAsync(string branchName)
+    {
+        try
+        {
+            return await Client.Git.Reference
+                .Get(_options.Owner, _options.Repository, HeadRefPrefix + branchName)
+                .ConfigureAwait(false);
+        }
+        catch (NotFoundException)
+        {
+            return null;
+        }
     }
 
     /// <inheritdoc />
@@ -158,7 +210,8 @@ public sealed class GitHubAdapter : IGitHubService
     /// <inheritdoc />
     /// <remarks>
     /// A versão 14 do Octokit não expõe overloads com <see cref="CancellationToken"/> nas rotas de
-    /// Git/pull request; por isso o token é validado no início da operação.
+    /// Git/pull request; por isso o token é validado no início da operação. A abertura é idempotente:
+    /// um PR já aberto para a mesma branch é devolvido em vez de provocar erro de validação.
     /// </remarks>
     public async Task<string> OpenPullRequestAsync(string branchName, string title, string description, CancellationToken cancellationToken)
     {
@@ -173,11 +226,58 @@ public sealed class GitHubAdapter : IGitHubService
             Body = description
         };
 
-        var pullRequest = await Client.PullRequest
-            .Create(_options.Owner, _options.Repository, newPullRequest)
+        try
+        {
+            var pullRequest = await Client.PullRequest
+                .Create(_options.Owner, _options.Repository, newPullRequest)
+                .ConfigureAwait(false);
+
+            return pullRequest.HtmlUrl;
+        }
+        catch (ApiValidationException)
+        {
+            // Idempotência: a API responde 422 quando já existe pull request aberto para a mesma
+            // branch (retrabalho da tarefa). O PR existente é o resultado esperado da operação, então
+            // a URL dele é devolvida em vez de falhar a entrega já commitada.
+            var existingPullRequest = await FindOpenPullRequestAsync(branchName).ConfigureAwait(false);
+
+            if (existingPullRequest is null)
+            {
+                // 422 por outro motivo (branch igual à base, título inválido, PR de fork): propaga.
+                throw;
+            }
+
+            _logger.LogInformation(
+                "Pull request da branch '{Branch}' já estava aberto em {Owner}/{Repository}; reutilizando {PullRequestUrl}.",
+                branchName,
+                _options.Owner,
+                _options.Repository,
+                existingPullRequest.HtmlUrl);
+
+            return existingPullRequest.HtmlUrl;
+        }
+    }
+
+    /// <summary>
+    /// Busca o pull request aberto cuja origem (head) é a branch informada, filtrando pela API com
+    /// <c>head = "usuário:branch"</c>. Devolve <c>null</c> quando não há nenhum.
+    /// </summary>
+    private async Task<PullRequest?> FindOpenPullRequestAsync(string branchName)
+    {
+        var request = new PullRequestRequest
+        {
+            State = ItemStateFilter.Open,
+            Head = $"{_options.Owner}:{branchName}"
+        };
+
+        var pullRequests = await Client.PullRequest
+            .GetAllForRepository(_options.Owner, _options.Repository, request)
             .ConfigureAwait(false);
 
-        return pullRequest.HtmlUrl;
+        // O filtro da API é tolerante a variações de nome; a comparação exata garante que o PR
+        // devolvido é realmente o da branch da tarefa.
+        return pullRequests.FirstOrDefault(pullRequest =>
+            string.Equals(pullRequest.Head?.Ref, branchName, StringComparison.Ordinal));
     }
 
     /// <inheritdoc />

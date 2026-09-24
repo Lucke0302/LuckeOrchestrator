@@ -30,6 +30,20 @@ public sealed class GoogleAiStudioAdapter(
     private const string GenerateContentOperation = ":generateContent";
     private const string EmbedContentOperation = ":embedContent";
 
+    /// <summary>
+    /// Instrução de geração de código. O contrato de múltiplos arquivos é fixado no próprio prompt
+    /// (JSON estrito caminho → conteúdo) porque é o parse dessa resposta que alimenta o commit: o
+    /// formato precisa ser previsível, e não inferido a cada resposta.
+    /// </summary>
+    private const string GenerateCodeInstruction =
+        """
+        Gere o código necessário para atender à tarefa.
+        Responda EXCLUSIVAMENTE com um objeto JSON válido, sem texto antes ou depois, no formato:
+        {"caminho/do/arquivo.cs": "conteúdo do código"}
+        Cada chave do objeto é o caminho relativo do arquivo dentro do repositório (use "/" como separador) e cada valor é o conteúdo completo daquele arquivo, já com os escapes do JSON.
+        Inclua uma chave por arquivo necessário para atender à tarefa.
+        """;
+
     private static readonly JsonSerializerOptions ResponseSerializerOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -44,8 +58,27 @@ public sealed class GoogleAiStudioAdapter(
     public Task<string> AnalyzeContextAsync(string payload, CancellationToken cancellationToken)
         => SendPromptAsync("Analise o contexto abaixo e descreva o plano de execução.", payload, cancellationToken);
 
-    public Task<string> GenerateCodeAsync(string payload, string contextAnalysis, CancellationToken cancellationToken)
-        => SendPromptAsync("Gere o código necessário para atender à tarefa.", $"{contextAnalysis}{Environment.NewLine}{payload}", cancellationToken);
+    /// <summary>
+    /// Gera os artefatos da tarefa sob o contrato de múltiplos arquivos (JSON estrito) e devolve o
+    /// mapa caminho → conteúdo pronto para o commit.
+    /// </summary>
+    /// <inheritdoc />
+    /// <exception cref="InvalidOperationException">
+    /// Quando o modelo não devolve o JSON de arquivos esperado (ver <see cref="ExtractFileArtifacts"/>).
+    /// </exception>
+    public async Task<Dictionary<string, string>> GenerateCodeAsync(string payload, string contextAnalysis, CancellationToken cancellationToken)
+    {
+        EnsureConfiguration();
+        ArgumentNullException.ThrowIfNull(payload);
+
+        var modelOutput = await SendPromptAsync(
+                GenerateCodeInstruction,
+                $"{contextAnalysis}{Environment.NewLine}{payload}",
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        return ExtractFileArtifacts(modelOutput);
+    }
 
     public Task<string> EvaluateErrorAsync(string payload, string generatedCode, string errorMessage, CancellationToken cancellationToken)
         => SendPromptAsync("Explique a causa da falha e proponha a correção.", $"{errorMessage}{Environment.NewLine}{generatedCode}{Environment.NewLine}{payload}", cancellationToken);
@@ -233,6 +266,69 @@ public sealed class GoogleAiStudioAdapter(
             ? string.Empty
             : AiStudioResponseReader.ExtractStructuredPayload(apiResponse);
     }
+
+    /// <summary>
+    /// Converte o JSON estrito de arquivos — já sem o Chain-of-Thought, pela mesma extração usada em
+    /// <see cref="ExtractPayload"/> — no dicionário caminho → conteúdo aceito por
+    /// <c>IGitHubService.CommitChangesAsync</c>.
+    /// </summary>
+    /// <param name="modelOutput">Texto saneado devolvido por <see cref="SendPromptAsync"/>.</param>
+    /// <returns>Artefatos por caminho relativo; dicionário vazio quando não houve payload algum.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// Quando há payload mas ele não é o objeto JSON de arquivos (chave string → valor string) ou
+    /// não traz nenhum arquivo. A exceção é a interface da falha para a mecânica de frustração: o
+    /// worker contabiliza a tentativa e escala o circuito para o modelo mais robusto no limite.
+    /// </exception>
+    private static Dictionary<string, string> ExtractFileArtifacts(string modelOutput)
+    {
+        if (string.IsNullOrWhiteSpace(modelOutput))
+        {
+            // Sem payload não há o que parsear: o dicionário vazio sinaliza "retorno vazio" ao worker.
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        Dictionary<string, string>? files;
+
+        try
+        {
+            files = JsonSerializer.Deserialize<Dictionary<string, string>>(modelOutput, ResponseSerializerOptions);
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException(
+                "O modelo não devolveu o JSON estrito de arquivos esperado ({\"caminho/do/arquivo.cs\": \"conteúdo\"}).",
+                ex);
+        }
+
+        if (files is null || files.Count == 0)
+        {
+            throw new InvalidOperationException("O JSON devolvido pelo modelo não contém nenhum arquivo.");
+        }
+
+        var artifacts = new Dictionary<string, string>(files.Count, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var file in files)
+        {
+            var path = NormalizeRepositoryPath(file.Key);
+
+            if (path.Length == 0)
+            {
+                // Chave em branco não é um caminho publicável no repositório.
+                continue;
+            }
+
+            artifacts[path] = file.Value;
+        }
+
+        return artifacts;
+    }
+
+    /// <summary>
+    /// Normaliza o caminho devolvido pelo modelo para o formato aceito pelo Git: separador
+    /// <c>/</c>, sem espaços nas pontas e sem barra inicial (caminho absoluto não é versionável).
+    /// </summary>
+    private static string NormalizeRepositoryPath(string path)
+        => path.Trim().Replace('\\', '/').TrimStart('/');
 
     /// <summary>
     /// Lê o envelope do <c>embedContent</c> e devolve os valores do vetor.

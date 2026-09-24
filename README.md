@@ -15,15 +15,18 @@ trabalho** é o índice vetorial da base de código.
 - [Fluxo de uma tarefa](#fluxo-de-uma-tarefa)
 - [Clean Architecture aplicada](#clean-architecture-aplicada)
 - [Estratégia MoE e Circuit Breaker de cota](#estratégia-moe-e-circuit-breaker-de-cota)
+- [Overdrive: escalada para o modelo mais robusto](#overdrive-escalada-para-o-modelo-mais-robusto)
 - [Extração segura da resposta do modelo](#extração-segura-da-resposta-do-modelo)
 - [Git Data API em memória (Octokit)](#git-data-api-em-memória-octokit)
 - [RAG: contexto da própria base de código](#rag-contexto-da-própria-base-de-código)
 - [Sumarização da descrição do Pull Request](#sumarização-da-descrição-do-pull-request)
 - [Fila e ciclo de vida da tarefa](#fila-e-ciclo-de-vida-da-tarefa)
+- [Host HTTP e webhook do GitHub](#host-http-e-webhook-do-github)
 - [Configuração e segredos](#configuração-e-segredos)
 - [Migrations (EF Core + pgvector)](#migrations-ef-core--pgvector)
 - [Resiliência do daemon](#resiliência-do-daemon)
 - [Como executar](#como-executar)
+- [Testes automatizados](#testes-automatizados)
 - [Limitações e próximos passos](#limitações-e-próximos-passos)
 
 ## Fluxo de uma tarefa
@@ -36,16 +39,19 @@ trabalho** é o índice vetorial da base de código.
  (fila) ───────► │  2. IEmbeddingProvider (text-embedding-004) ──► pgvector: code_documents      │
    dequeue       │  3. SearchSimilarAsync(limit 3) ──► "Arquivos de referência: ..." (contexto)  │
                  │  4. ITaskRouter.ResolveProvider(complexidade) ──► expert da cadeia MoE        │
-                 │  5. ILLMProvider.GenerateCodeAsync(payload, contexto) ──► artefato            │
+                 │  5. ILLMProvider.GenerateCodeAsync(payload, contexto) ──► arquivos (JSON)     │
                  │  6. IGitHubService: CreateBranch ─► Commit ─► OpenPullRequest (resumo do PR)   │
                  │  7. AgentTask with { Status = Concluida, Branch, PullRequestUrl }             │
                  └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-1. **Indexação (RAG)** — a cada `Orchestrator:IndexingIntervalMinutes`, o `CodebaseIndexerService`
-   lê os arquivos `.cs` da branch base via Git Data API, compara o SHA-256 do conteúdo com o
-   `content_hash` gravado em `code_documents` e só embute (e grava) o que é novo ou mudou. Embedding
-   consome cota, então arquivo inalterado nunca é reenviado ao provedor.
+O host também expõe `POST /api/webhook/github`, que dispara a indexação do RAG sob demanda (ver
+[Host HTTP e webhook do GitHub](#host-http-e-webhook-do-github)).
+
+1. **Indexação (RAG)** — a cada `Orchestrator:IndexingIntervalMinutes` (ou a cada webhook do GitHub),
+   o `CodebaseIndexerService` lê os arquivos `.cs` da branch base via Git Data API, compara o SHA-256
+   do conteúdo com o `content_hash` gravado em `code_documents` e só embute (e grava) o que é novo ou
+   mudou. Embedding consome cota, então arquivo inalterado nunca é reenviado ao provedor.
 2. **Dequeue** — `IAgentTaskRepository.GetNextPendingTaskAsync` reivindica a tarefa `Pendente` mais
    antiga e a marca como `EmExecucao` em um `UPDATE` condicional: se outra instância pegar a mesma
    linha no intervalo, nenhuma linha é afetada e a reivindicação é descartada (sem processamento
@@ -55,9 +61,13 @@ trabalho** é o índice vetorial da base de código.
 4. **Roteamento MoE** — o `MoETaskRouter` escolhe o primeiro expert com cota ativa na cadeia da
    complexidade; se a cadeia inteira estiver bloqueada, a tarefa **sobe** para a complexidade
    superior.
-5. **Geração** — o expert devolve o artefato a partir do payload + contexto da base.
-6. **Entrega** — branch `feat/task-{id}`, commit com o artefato em `Orchestrator:GeneratedArtifactPath`
-   e pull request com a descrição sumarizada por um expert rápido (`TaskComplexity.Baixo`).
+5. **Geração** — o expert devolve um objeto **JSON estrito** `{"caminho/do/arquivo.cs": "conteúdo"}`
+   (um ou mais arquivos) a partir do payload + contexto da base. Resposta fora desse formato é
+   convertida em falha e alimenta a mecânica de frustração (ver
+   [Overdrive](#overdrive-escalada-para-o-modelo-mais-robusto)).
+6. **Entrega** — branch `feat/task-{id}`, commit com **todos** os arquivos do dicionário (sem caminho
+   fixo de artefato) e pull request com a descrição sumarizada por um expert rápido
+   (`TaskComplexity.Baixo`).
 7. **Persistência** — a tarefa é gravada como `Concluida` com `Branch` e `PullRequestUrl`
    (o record imutável do Domain é mutado por `with`).
 
@@ -78,7 +88,8 @@ OrquestradorLucke.Worker          → DI, IOptions e BackgroundService (host do 
 | **Domain** | Regras que não dependem de tecnologia | `AgentTask`, `CodeDocument`, `TaskComplexity`, `AgentTaskStatus`, `FrustrationTracker`, `QuotaExhaustedException` |
 | **Application** | Contratos e orquestração de caso de uso | `IAgentTaskRepository`, `ILLMProvider`, `IEmbeddingProvider`, `ICodeContextRepository`, `IGitHubService`, `ITaskRouter`, `IQuotaManager`, `CodebaseIndexerService` |
 | **Infrastructure** | Implementações reais | `AppDbContext` (+ migrations), `AgentTaskRepository`, `CodeContextRepository`, `GoogleAiStudioAdapter`, `GitHubAdapter`, `MoETaskRouter`, `InMemoryQuotaManager`, `ModelCatalog` |
-| **Worker** | Composição e laço do daemon | `Program`, `DependencyInjectionSetup`, `LuckeOrchestratorWorker`, `OrchestratorWorkerOptions` |
+| **Worker** | Composição e laço do daemon | `Program` (host HTTP + webhook), `DependencyInjectionSetup`, `LuckeOrchestratorWorker`, `OrchestratorWorkerOptions` |
+| **Tests** | Testes automatizados (xUnit + Moq + FluentAssertions) | `MoETaskRouterTests` |
 
 Regras respeitadas no código:
 
@@ -88,8 +99,9 @@ Regras respeitadas no código:
   usa `IGitHubService`, `IEmbeddingProvider` e `ICodeContextRepository`;
 - o **EF Core e o pgvector** existem somente na Infrastructure: o `AppDbContext`, as migrations e a
   configuração da coluna `vector(d)` ficam lá, e o **Worker não declara pacote de banco** — só
-  `Microsoft.EntityFrameworkCore.Design` (`PrivateAssets=all`, para o EF CLI rodar contra o projeto
-  do host), `Microsoft.Extensions.Hosting` e `Hosting.Systemd`;
+  `Microsoft.EntityFrameworkCore.Design` (`PrivateAssets=all`, para o EF CLI rodar contra o projeto do
+  host) e `Hosting.Systemd`. O host web vem de `<FrameworkReference Include="Microsoft.AspNetCore.App" />`
+  (referência de framework, não pacote), que já traz `Microsoft.Extensions.Hosting`;
 - serviços **Scoped** (`AppDbContext`, repositories, adapters, clientes HTTP) são resolvidos dentro
   de um escopo criado por `IServiceScopeFactory` a cada iteração do laço — nunca injetados no
   construtor do `BackgroundService`, o que prenderia o `DbContext` ao tempo de vida do processo;
@@ -120,11 +132,34 @@ complexidade e a dimensão dos vetores de embedding.
   24 h por padrão) e lança `QuotaExhaustedException`. A exceção **não** deriva de
   `HttpRequestException` de propósito: a política de retry não repete a chamada (repetir não
   recupera cota) e o fallback desce para o próximo modelo da cadeia.
-- `FrustrationTracker` (Domain) contabiliza falhas de execução (ex.: retorno vazio) e marca
-  `OverdriveDisparado` ao atingir `Frustration:MaxFailures`, sinalizando escalada para o modelo mais
-  robusto (`ITaskRouter.ResolveOverdriveProvider()`).
+- `FrustrationTracker` (Domain) contabiliza as falhas de geração do daemon e marca
+  `OverdriveDisparado` ao atingir `Frustration:MaxFailures` — é o gatilho do overdrive descrito
+  abaixo.
 - Política Polly (`HttpResilience`): retry com backoff exponencial para 5xx/408 e
   `HttpRequestException`; 400/401/403/404 falham sem retry.
+
+## Overdrive: escalada para o modelo mais robusto
+
+A mecânica de frustração é o que impede o daemon de insistir em um expert que não entrega:
+
+1. cada tentativa de geração que falha — exceção do provedor (ex.: resposta que não é o JSON estrito
+   de arquivos) ou retorno sem nenhum arquivo — incrementa o `FrustrationTracker`
+   (`Frustration:MaxFailures`, 3 por padrão);
+2. enquanto o limite **não** é atingido, a tarefa é encerrada como `Falhou` neste ciclo (comportamento
+   anterior, preservado);
+3. ao atingir o limite o circuito **desarma**: o laço loga `Ativando Overdrive`, resolve o expert mais
+   robusto com `ITaskRouter.ResolveOverdriveProvider()` (cadeia `Critico`, com o fallback interno
+   dela) e faz **uma última tentativa** de geração;
+4. só se essa tentativa também falhar a tarefa é marcada como `Falhou`.
+
+O medidor vive no `LuckeOrchestratorWorker` (campo do `BackgroundService`), e **não** no escopo da
+iteração: cada tarefa tem uma única tentativa por ciclo, logo um contador local nunca alcançaria o
+limite e o overdrive jamais dispararia. Ele é **zerado no primeiro sucesso** (`RegistrarSucesso`), o
+que rearma o circuito.
+
+`QuotaExhaustedException` **não** conta como frustração: cota esgotada é tratada pelo Circuit Breaker
+(devolve a tarefa para a fila + *cooldown*) e não consome tentativa do overdrive. O mesmo vale para o
+desligamento do host, que devolve a tarefa para `Pendente`.
 
 ## Extração segura da resposta do modelo
 
@@ -138,8 +173,28 @@ Os modelos Gemma imprimem o raciocínio (*Chain-of-Thought*) antes do payload. O
    restante já sem marcas de raciocínio (`* Input:`, `- Constraint:`, tags `thinking`/`scratchpad`,
    tokens `start_of_turn`…).
 
-Resposta sem payload devolve `string.Empty`, e o worker trata isso como falha da execução
-(incrementa a frustração e marca a tarefa como `Falhou`) em vez de commitar conteúdo vazio.
+Resposta sem payload devolve dicionário vazio e o worker trata isso como falha da execução
+(incrementa a frustração em vez de commitar arquivo vazio).
+
+### Contrato de múltiplos arquivos
+
+O prompt de `GenerateCodeAsync` fixa o formato da resposta: um objeto JSON estrito, sem texto antes ou
+depois.
+
+```json
+{ "src/Caminho/Arquivo.cs": "conteúdo completo do arquivo" }
+```
+
+- a **chave** é o caminho relativo do arquivo no repositório (a barra invertida do Windows é
+  normalizada para `/` e a barra inicial é removida — caminho absoluto não é versionável);
+- o **valor** é o conteúdo completo daquele arquivo;
+- uma chave por arquivo necessário: a tarefa pode entregar quantos arquivos precisar.
+
+Depois da extração do Chain-of-Thought, esse JSON é desserializado em `Dictionary<string, string>` e
+segue direto para `CommitChangesAsync` — não existe mais caminho fixo de artefato. Se houver payload
+mas ele **não** for esse objeto JSON (chave e valor strings) ou não trouxer arquivo nenhum, o adaptador
+lança `InvalidOperationException`: a exceção é a interface da falha com a mecânica de frustração e
+leva à escalada de modelo (overdrive ao atingir o limite).
 
 ## Git Data API em memória (Octokit)
 
@@ -158,6 +213,20 @@ O Octokit 14 não expõe overloads com `CancellationToken` nas rotas de Git; por
 o token antes da árvore e a cada blob baixado. Blobs acima do limite da API voltam sem base64 e são
 ignorados na indexação. O token do agente autônomo (`GitHub:Token`) é obrigatório: o adapter falha
 rápido na construção quando ele não está configurado.
+
+### Idempotência da entrega
+
+Reprocessar uma tarefa (desligamento do daemon entre o commit e a abertura do PR, nova tentativa,
+reentrega manual) não pode falhar por causa do que já foi criado. As duas operações que a API do
+GitHub recusa com `422` são tratadas como "já existe":
+
+| Operação | Quando já existe | Comportamento |
+| --- | --- | --- |
+| `CreateBranchAsync` | branch `feat/task-{id}` já criada (`POST git/refs` → 422) | lê a referência existente (`GET git/ref`), loga e devolve o `ref` dela — o fluxo segue de onde estava |
+| `OpenPullRequestAsync` | PR aberto para a mesma branch (`POST pulls` → 422) | busca o PR com `GET pulls?state=open&head={owner}:{branch}`, confere o `head.ref` exato e devolve a URL dele |
+
+Em ambos os casos, se a validação falhar por **outro** motivo (nome inválido, permissão, PR entre
+forks), a exceção original é propagada — a idempotência não mascara erros legítimos.
 
 ## RAG: contexto da própria base de código
 
@@ -190,6 +259,12 @@ Embedding      ReadOnlyMemory<float>                                  embedding 
   pgvector). Na `Pgvector.EntityFrameworkCore` 0.3.0 `CosineDistance` é uma extensão de `object`
   (`EF.Functions.CosineDistance(a, b)` não existe nessa versão); o vetor de consulta é enviado como
   `Pgvector.Vector` para o parâmetro chegar ao banco no tipo `vector`.
+- **Índice vetorial aproximado (HNSW):** a coluna `embedding` tem o índice
+  `ix_code_documents_embedding_hnsw` com `USING hnsw (embedding vector_cosine_ops)` — a mesma classe de
+  operadores da consulta (`<=>`), condição para o planner usar o índice em vez de um *seq scan*
+  ordenado por distância. Sem ele a busca degrada linearmente com o tamanho do índice; com ele a
+  latência se mantém estável em bases grandes. Os parâmetros do HNSW (`m`, `ef_construction`) ficam no
+  default do pgvector.
 - **Indexação incremental:** o indexador lista os caminhos já presentes (`GetAllTrackedFilesAsync`),
   compara os hashes gravados (`GetTrackedContentHashesAsync`) com o SHA-256 do conteúdo atual e só
   então chama o provedor de embeddings. O `UpsertDocumentAsync` procura pelo `FilePath`: se não
@@ -202,14 +277,19 @@ Embedding      ReadOnlyMemory<float>                                  embedding 
 
 ## Sumarização da descrição do Pull Request
 
-Depois de gerar o artefato, o worker resolve um expert rápido (`TaskComplexity.Baixo`) e pede:
+Depois de gerar os arquivos, o worker resolve um expert rápido (`TaskComplexity.Baixo`) e pede:
 
 > "Crie um resumo curto em texto puro para a descrição de um Pull Request que implementou esta
-> tarefa: {payload}. O código gerado foi: {código gerado}"
+> tarefa: {payload}. Arquivos gerados: ### {caminho} {conteúdo}"
 
-A resposta vira o corpo (*body*) do pull request. Se o sumarizador falhar (cota, timeout) ou
-devolver vazio, o PR usa a descrição determinística (`Entrega automática da tarefa …` + payload):
-a entrega já commitada não é desfeita por causa do resumo.
+O conteúdo de cada arquivo entra limitado a 2000 caracteres (o resumo descreve a mudança, não o código
+inteiro, e um prompt gigante só consumiria contexto e cota). O expert responde sob o mesmo contrato
+JSON da geração, então o resumo é o texto útil devolvido — concatenado quando vem distribuído em mais
+de um valor.
+
+A resposta vira o corpo (*body*) do pull request. Se o sumarizador falhar (cota, timeout), devolver
+vazio ou devolver algo que não é o JSON esperado, o PR usa a descrição determinística (`Entrega
+automática da tarefa …` + payload): a entrega já commitada não é desfeita por causa do resumo.
 
 ## Fila e ciclo de vida da tarefa
 
@@ -217,14 +297,41 @@ a entrega já commitada não é desfeita por causa do resumo.
 | --- | --- |
 | `Pendente` | na fila, aguardando dequeue |
 | `EmExecucao` | reivindicada pelo worker (o dequeue já grava esse status) |
-| `Concluida` | artefato commitado; `Branch` e `PullRequestUrl` preenchidos |
-| `Falhou` | retorno vazio do modelo ou falha não recuperável |
+| `Concluida` | arquivos commitados e PR aberto; `Branch` e `PullRequestUrl` preenchidos |
+| `Falhou` | geração sem arquivos, resposta fora do JSON estrito ou falha não recuperável (após a tentativa do overdrive, quando disparado) |
 | `Cancelada` | interrompida por solicitação/desligamento |
 
 O índice `ix_agent_tasks_status_criado_em` (`status`, `criado_em`) atende exatamente o dequeue:
 `WHERE status = 'Pendente' ORDER BY criado_em`. A tabela é a única interface com o resto do sistema —
 qualquer produtor pode inserir uma linha `Pendente` (com `payload` e `complexidade`) e o daemon a
 processa sem reinício.
+
+## Host HTTP e webhook do GitHub
+
+O host é criado com `WebApplication.CreateBuilder(args)` (Kestrel + Minimal APIs) **sem deixar de ser
+um worker**: o `LuckeOrchestratorWorker` continua registrado como `BackgroundService` e o laço da fila
+roda normalmente.
+
+```csharp
+app.MapPost("/api/webhook/github", (IServiceScopeFactory scopeFactory, ILoggerFactory loggerFactory) =>
+{
+    _ = SynchronizeCodebaseIndexAsync(scopeFactory, loggerFactory.CreateLogger("OrquestradorLucke.Webhook.GitHub"));
+
+    return Results.Accepted();
+});
+```
+
+- a resposta é **`202 Accepted` imediato** — o GitHub cancela entregas que passam de ~10 s, e a
+  indexação completa (árvore do repositório + embeddings) pode levar bem mais que isso;
+- a sincronização roda em background, em um **escopo próprio** (`IServiceScopeFactory`), porque o
+  `CodebaseIndexerService` e o `DbContext` que ele consome são Scoped;
+- falha na indexação é absorvida com log (categoria `OrquestradorLucke.Webhook.GitHub`): o índice atual
+  continua servindo de contexto e o próximo ciclo reindexa o que faltou;
+- com o webhook configurado, `Orchestrator:IndexingIntervalMinutes` deixa de ser o gatilho principal e
+  passa a ser a rede de segurança contra eventos perdidos.
+
+Endereço e porta vêm do host (Kestrel), não do código: defina `ASPNETCORE_URLS`
+(ex.: `ASPNETCORE_URLS=http://127.0.0.1:5080`) no unit do systemd — sem isso o Kestrel usa o default.
 
 ## Configuração e segredos
 
@@ -241,8 +348,8 @@ processa sem reinício.
 | `Frustration:MaxFailures` | falhas toleradas antes do overdrive |
 | `Orchestrator:PollingIntervalSeconds` | cadência do laço quando a fila está vazia |
 | `Orchestrator:QuotaCooldownMinutes` | cooldown do laço quando toda a cadeia MoE está bloqueada |
-| `Orchestrator:GeneratedArtifactPath` | caminho do arquivo entregue no commit (ex.: `Feature.cs`) |
-| `Orchestrator:IndexingIntervalMinutes` | cadência do indexador do RAG |
+| `Orchestrator:IndexingIntervalMinutes` | cadência (rede de segurança) do indexador do RAG |
+| `ASPNETCORE_URLS` | endereço/porta do host HTTP que atende o webhook (default do Kestrel quando omitido) |
 
 > **Atenção (systemd/Production):** user-secrets e `appsettings.Development.json` **não** são
 > carregados fora do ambiente Development. Em produção, `AiStudio:ApiKey`, `GitHub:Token`,
@@ -252,20 +359,43 @@ processa sem reinício.
 
 ## Migrations (EF Core + pgvector)
 
-O EF CLI roda contra a Infrastructure através do `AppDbContextFactory` (design-time), que lê a
-connection string da variável de ambiente — sem valor hardcoded:
+O EF CLI (`dotnet-ef` 10.0.4, mesma versão do pacote EF Core) roda contra a Infrastructure através do
+`AppDbContextFactory` (design-time), que lê a connection string da variável de ambiente — sem valor
+hardcoded:
 
 ```powershell
+dotnet tool update --global dotnet-ef --version 10.0.4
+
 $env:ConnectionStrings__DefaultConnection='Host=<host>;Database=lucke_db;Username=<user>;Password=<senha>'
-dotnet ef migrations add AddCodeDocuments --project OrquestradorLucke.Infrastructure --output-dir Data/Migrations
-dotnet ef database update                 --project OrquestradorLucke.Infrastructure
+
+# Cria a migration do índice vetorial aproximado
+dotnet ef migrations add AddHnswIndex --project OrquestradorLucke.Infrastructure --output-dir Data/Migrations
+
+# Aplica no banco (idempotente por histórico de migrations)
+dotnet ef database update --project OrquestradorLucke.Infrastructure
+
+# Confere o que falta aplicar e o SQL que será emitido
+dotnet ef migrations list --project OrquestradorLucke.Infrastructure
+dotnet ef migrations script 20260924180507_AddCodeDocuments 20260924182849_AddHnswIndex `
+    --project OrquestradorLucke.Infrastructure -o hnsw.sql
 ```
 
 Migrations existentes:
 
 - `InitialCreate` — `CREATE EXTENSION IF NOT EXISTS vector` + tabela `agent_tasks`;
 - `AddCodeDocuments` — tabela `code_documents` com `embedding vector(768) NOT NULL` e índice único
-  `ux_code_documents_file_path` (chave natural do upsert).
+  `ux_code_documents_file_path` (chave natural do upsert);
+- `AddHnswIndex` — índice vetorial aproximado da coluna de embedding:
+
+  ```sql
+  CREATE INDEX ix_code_documents_embedding_hnsw
+      ON code_documents USING hnsw (embedding vector_cosine_ops);
+  ```
+
+  O `USING hnsw` transforma a busca por similaridade de um *seq scan* ordenado por `<=>` em uma busca
+  aproximada por grafo; o `vector_cosine_ops` é obrigatório para o planner aceitar o índice na consulta
+  `ORDER BY embedding <=> @p` feita por `SearchSimilarAsync`. A `Down` da migration derruba apenas o
+  índice — nenhum dado é afetado.
 
 > **Aplique `database update` antes de rodar o daemon.** Sem a tabela, a indexação e o RAG falham de
 > forma degradada (a tarefa segue sem contexto, com log de aviso) — a fila continua funcionando.
@@ -274,7 +404,11 @@ Migrations existentes:
 
 - **Cota esgotada** em toda a cadeia MoE: a tarefa volta para `Pendente`, o worker loga o *cooldown*
   e dorme `Orchestrator:QuotaCooldownMinutes` (15 min por padrão) para desestressar o provedor.
-- **Falha genérica**: log do erro e tarefa marcada como `Falhou`.
+- **Falha de geração**: incrementa a frustração e marca a tarefa como `Falhou`; ao atingir
+  `Frustration:MaxFailures` o laço **ativa o overdrive** e faz uma última tentativa no modelo mais
+  robusto antes de desistir (ver [Overdrive](#overdrive-escalada-para-o-modelo-mais-robusto)).
+- **Reentrega idempotente**: branch e PR já existentes são reutilizados, então reprocessar uma tarefa
+  não falha por causa do que já foi entregue.
 - **Desligamento** (Ctrl+C / `systemctl stop`): a tarefa em execução volta para `Pendente` — a
   gravação usa `CancellationToken.None`, pois o token do host já está cancelado — e nada fica preso
   em `EmExecucao`.
@@ -295,33 +429,68 @@ dotnet user-secrets set "GitHub:Token"    "<token>" --project OrquestradorLucke.
 $env:ConnectionStrings__DefaultConnection='Host=<host>;Database=lucke_db;Username=<user>;Password=<senha>'
 dotnet ef database update --project OrquestradorLucke.Infrastructure
 
-# 3) Daemon
+# 3) Daemon (o host sobe o laço do orquestrador e o host HTTP do webhook)
 dotnet run --project OrquestradorLucke.Worker
 
 # 4) Enfileira uma tarefa (exemplo via psql)
 INSERT INTO agent_tasks (id, payload, complexidade, status, criado_em)
 VALUES (gen_random_uuid(), 'Criar endpoint de cálculo de frete', 'Medio', 'Pendente', now());
+
+# 5) Webhook do GitHub (202 Accepted; a indexação segue em background)
+Invoke-WebRequest -Method Post http://localhost:5000/api/webhook/github
 ```
+
+Para rodar a suíte de testes: `dotnet test` (ou por projeto, como em
+[Testes automatizados](#testes-automatizados)).
 
 Em produção, o deploy é o workflow `.github/workflows/deploy.yml`
 (`dotnet publish -c Release` para `/var/opt/lucke-orchestrator` + `systemctl restart
 lucke-orchestrator.service`). O `AddSystemd()` habilita `Type=notify`/journald automaticamente, e o
 lifetime de console (Ctrl+C, shutdown gracioso) continua valendo em execução manual.
 
+> **Runtime em produção:** como o host passou a ser um `WebApplication`, o servidor precisa do
+> **runtime do ASP.NET Core** (`Microsoft.AspNetCore.App` 10) — já incluído no SDK 10 — além do runtime
+> base, e o unit do systemd precisa liberar a porta definida em `ASPNETCORE_URLS`.
+
+## Testes automatizados
+
+Projeto `OrquestradorLucke.Tests` (xUnit, Moq e FluentAssertions 7.2 — a linha 7.x permanece
+Apache-2.0, enquanto a 8.x passou para a licença Xceed), referenciando `Domain`, `Application` e
+`Infrastructure`:
+
+```powershell
+dotnet test OrquestradorLucke.Tests\OrquestradorLucke.Tests.csproj
+dotnet test OrquestradorLucke.slnx          # solução completa
+```
+
+`MoETaskRouterTests` cobre o roteamento MoE com o `InMemoryQuotaManager` real e experts mockados (o
+roteador só consulta `ModelName`), derivando as expectativas do próprio `ModelCatalog` para não
+duplicar a ordem das cadeias:
+
+- a cadeia de cada complexidade é devolvida na ordem de prioridade (a cada bloqueio de cota, o próximo
+  modelo da cadeia assume);
+- cadeia inteira bloqueada ⇒ a tarefa **sobe** para a complexidade superior;
+- todos os modelos bloqueados ⇒ `QuotaExhaustedException`;
+- `ResolveOverdriveProvider` devolve o cabeça da cadeia `Critico` e respeita o fallback dela;
+- modelo do catálogo sem expert registrado ⇒ falha rápida na construção do roteador.
+
 ## Limitações e próximos passos
 
-- **Um arquivo por tarefa:** `GenerateCodeAsync` devolve uma `string`; o commit publica o artefato em
-  `Orchestrator:GeneratedArtifactPath`. Um formato JSON de múltiplos arquivos é a evolução natural.
-- **Busca vetorial exata:** o `code_documents` usa *seq scan* ordenado por `<=>`. Para bases grandes,
-  um índice aproximado (`hnsw`/`ivfflat` com `vector_cosine_ops`) resolve a latência.
-- **Overdrive:** `FrustrationTracker` e `ResolveOverdriveProvider()` já existem, mas a tarefa é
-  marcada como `Falhou` no ciclo; a retentativa escalonada no modelo mais robusto é o próximo passo.
-- **Idempotência de entrega:** um desligamento entre o commit e a abertura do PR devolve a tarefa
-  para `Pendente`; no ciclo seguinte a branch já existiria (tratar com `409 Conflict`).
-- **Indexação sob demanda:** hoje o indexador roda por intervalo; um gancho pós-merge (webhook)
-  deixaria o índice quente com menos chamadas à API do GitHub.
-- **Testes automatizados:** não há projeto de testes na solução (Domain puro e adapters preparam
-  facilmente um projeto `xUnit`).
+- **Assinatura do webhook:** o endpoint aceita qualquer `POST`; validar o HMAC-SHA256
+  (`X-Hub-Signature-256`) com um segredo vindo de `IOptions` é o próximo passo antes de expor o host
+  fora da rede interna.
+- **Indexações concorrentes pelo webhook:** cada entrega abre um escopo e roda o indexador em paralelo;
+  uma fila de gatilhos (ex.: `Channel`) com um único consumidor serializa o trabalho em rajadas.
+- **Overdrive sem histórico por tarefa:** a escalada é uma tentativa única no modelo mais robusto, e o
+  medidor é global do daemon (não por tarefa); retentativas múltiplas com histórico de falhas por
+  tarefa é a evolução natural.
+- **Índice órfão:** arquivos removidos da branch base continuam em `code_documents` (o indexador só faz
+  upsert); uma limpeza por diferença de árvore fecharia o ciclo.
+- **Cota em memória:** `InMemoryQuotaManager` perde o estado no restart; com mais de uma instância, o
+  Circuit Breaker de cota precisa ser compartilhado (Redis/Postgres).
+- **Migrations no deploy:** o workflow publica o binário mas não roda `dotnet ef database update`;
+  aplicar as migrations no pipeline (ou versionar o script idempotente) fecha a lacuna entre código e
+  banco.
 
 
 

@@ -12,9 +12,16 @@ namespace OrquestradorLucke.Worker;
 /// Laço principal do orquestrador. Cada iteração abre um escopo próprio de DI — para que nenhuma
 /// dependência (DbContext, adapters, Typed Clients) carregue estado entre execuções — e percorre o
 /// ciclo completo: indexação do RAG, dequeue da fila, recuperação do contexto da própria base de
-/// código, roteamento MoE da complexidade, geração do artefato pelo expert, sumarização da descrição
-/// do pull request e entrega da branch/commit/PR pela conta de agente autônomo.
+/// código, roteamento MoE da complexidade, geração dos arquivos pelo expert (um JSON estrito
+/// caminho → conteúdo), sumarização da descrição do pull request e entrega da branch/commit/PR pela
+/// conta de agente autônomo.
 /// </summary>
+/// <remarks>
+/// Falhas de geração alimentam o <see cref="FrustrationTracker"/> do daemon: ao atingir
+/// <c>Frustration:MaxFailures</c> o circuito desarma e a tarefa ganha uma última tentativa no modelo
+/// mais robusto do catálogo (<see cref="ITaskRouter.ResolveOverdriveProvider"/>) antes de ser
+/// marcada como <c>Falhou</c>.
+/// </remarks>
 public sealed class LuckeOrchestratorWorker(
     IServiceScopeFactory scopeFactory,
     ILogger<LuckeOrchestratorWorker> logger) : BackgroundService
@@ -25,8 +32,22 @@ public sealed class LuckeOrchestratorWorker(
     /// <summary>Documentos de referência que o RAG entrega ao expert por tarefa.</summary>
     private const int SimilarDocumentsLimit = 3;
 
+    /// <summary>
+    /// Limite de caracteres do conteúdo de cada arquivo embutido no prompt de sumarização do pull
+    /// request: o resumo descreve a mudança, não precisa do código inteiro.
+    /// </summary>
+    private const int MaxSummaryContentLengthPerFile = 2000;
+
     /// <summary>Instante (UTC) do último ciclo de indexação concluído — governa a cadência configurada.</summary>
     private DateTimeOffset _lastIndexingAtUtc = DateTimeOffset.MinValue;
+
+    /// <summary>
+    /// Medidor de frustração do daemon: acumula as falhas de geração entre iterações e é zerado no
+    /// primeiro sucesso (o circuito volta a armar). Vive no campo do <see cref="BackgroundService"/>
+    /// — e não no escopo da iteração — porque cada tarefa tem uma única tentativa por ciclo: um
+    /// contador local nunca alcançaria <c>Frustration:MaxFailures</c> e o overdrive jamais dispararia.
+    /// </summary>
+    private FrustrationTracker? _frustrationTracker;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -67,8 +88,9 @@ public sealed class LuckeOrchestratorWorker(
                 continue;
             }
 
-            // Medidor de frustração da execução atual: cada falha (retorno vazio etc.) o aproxima do overdrive.
-            var frustrationTracker = new FrustrationTracker(Math.Max(1, frustrationSettings.MaxFailures));
+            // Medidor de frustração compartilhado pelo daemon: cada falha de geração (retorno sem
+            // arquivos, JSON estrito inválido do modelo) aproxima o circuito do overdrive.
+            var frustrationTracker = _frustrationTracker ??= new FrustrationTracker(Math.Max(1, frustrationSettings.MaxFailures));
 
             try
             {
@@ -90,40 +112,60 @@ public sealed class LuckeOrchestratorWorker(
                         stoppingToken)
                     .ConfigureAwait(false);
 
-                var generatedCode = await provider
-                    .GenerateCodeAsync(task.Payload, contextAnalysis, stoppingToken)
+                // Uma tentativa de geração: falha (exceção do provedor ou retorno sem arquivos) já
+                // incrementa o medidor de frustração e devolve null, sem derrubar a iteração.
+                var artifacts = await TryGenerateArtifactsAsync(
+                        provider,
+                        task,
+                        contextAnalysis,
+                        frustrationTracker,
+                        stoppingToken)
                     .ConfigureAwait(false);
 
-                if (string.IsNullOrWhiteSpace(generatedCode))
+                // Circuito desarmado: o limite de falhas foi atingido, então a tarefa ganha uma última
+                // tentativa no expert mais robusto do catálogo antes de ser dada como perdida.
+                if (artifacts is null && frustrationTracker.OverdriveDisparado)
                 {
-                    // Retorno vazio é falha para a mecânica de frustração: o circuito se aproxima do
-                    // overdrive e a tarefa é encerrada como Falhou neste ciclo.
-                    var overdriveTriggered = frustrationTracker.RegistrarFalha();
+                    var overdriveProvider = taskRouter.ResolveOverdriveProvider();
 
                     logger.LogWarning(
-                        "Expert '{ModelName}' devolveu retorno vazio para a tarefa {TaskId}: falha {Falhas}/{Limite} (overdrive: {Overdrive}).",
-                        provider.ModelName,
+                        "Ativando Overdrive na tarefa {TaskId}: {Falhas} falha(s) acumulada(s) no limite de {Limite}; escalando para o expert '{ModelName}'.",
                         task.Id,
                         frustrationTracker.ContadorAtual,
                         frustrationTracker.LimiteMaximo,
-                        overdriveTriggered);
+                        overdriveProvider.ModelName);
 
+                    artifacts = await TryGenerateArtifactsAsync(
+                            overdriveProvider,
+                            task,
+                            contextAnalysis,
+                            frustrationTracker,
+                            stoppingToken)
+                        .ConfigureAwait(false);
+
+                    if (artifacts is not null)
+                    {
+                        provider = overdriveProvider;
+                    }
+                }
+
+                if (artifacts is null)
+                {
+                    // Falhou no expert da cadeia e, quando o overdrive disparou, também no modelo mais
+                    // robusto: só então a tarefa é encerrada neste ciclo (um sucesso zera o medidor).
                     await UpdateStatusAsync(taskRepository, task, AgentTaskStatus.Falhou, stoppingToken)
                         .ConfigureAwait(false);
 
                     continue;
                 }
 
-                // Braços (GitHub): branch de trabalho, commit com o artefato gerado e pull request.
+                // Braços (GitHub): branch de trabalho, commit dos arquivos gerados e pull request.
                 var branchName = $"{BranchNamePrefix}{task.Id}";
 
                 await gitHubService.CreateBranchAsync(branchName, stoppingToken).ConfigureAwait(false);
 
-                var artifacts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-                {
-                    [options.GeneratedArtifactPath] = generatedCode
-                };
-
+                // O expert devolve um JSON caminho → conteúdo: o dicionário segue direto para o commit,
+                // sem caminho de artefato fixo (uma tarefa pode entregar quantos arquivos precisar).
                 await gitHubService
                     .CommitChangesAsync(
                         branchName,
@@ -132,11 +174,11 @@ public sealed class LuckeOrchestratorWorker(
                         stoppingToken)
                     .ConfigureAwait(false);
 
-                // Descrição do PR: sumarizada por um expert rápido a partir da tarefa e do código.
+                // Descrição do PR: sumarizada por um expert rápido a partir da tarefa e dos artefatos.
                 var pullRequestDescription = await BuildPullRequestSummaryAsync(
                         taskRouter,
                         task,
-                        generatedCode,
+                        artifacts,
                         stoppingToken)
                     .ConfigureAwait(false);
 
@@ -162,9 +204,11 @@ public sealed class LuckeOrchestratorWorker(
                 await taskRepository.UpdateTaskAsync(concludedTask, stoppingToken).ConfigureAwait(false);
 
                 logger.LogInformation(
-                    "Tarefa {TaskId} concluída na branch '{Branch}'. Pull request: {PullRequestUrl}.",
+                    "Tarefa {TaskId} concluída na branch '{Branch}' pelo expert '{ModelName}' ({FileCount} arquivo(s)). Pull request: {PullRequestUrl}.",
                     task.Id,
                     branchName,
+                    provider.ModelName,
+                    artifacts.Count,
                     pullRequestUrl);
             }
             catch (QuotaExhaustedException ex)
@@ -213,6 +257,86 @@ public sealed class LuckeOrchestratorWorker(
                     .ConfigureAwait(false);
             }
         }
+    }
+
+    /// <summary>
+    /// Executa uma tentativa de geração com o expert informado, convertendo falha em frustração.
+    /// </summary>
+    /// <remarks>
+    /// A exceção não é propagada de propósito: o worker decide o que fazer com a falha (nova
+    /// tentativa no modelo mais robusto, no overdrive, ou encerramento da tarefa). Cota esgotada e
+    /// desligamento do host continuam propagando, pois não são frustração do expert — são tratados
+    /// pelos <c>catch</c> específicos do laço (devolução da tarefa à fila + cooldown).
+    /// </remarks>
+    /// <returns>Artefatos por caminho, ou <c>null</c> quando a tentativa falhou.</returns>
+    private async Task<IReadOnlyDictionary<string, string>?> TryGenerateArtifactsAsync(
+        ILLMProvider provider,
+        AgentTask task,
+        string contextAnalysis,
+        FrustrationTracker frustrationTracker,
+        CancellationToken stoppingToken)
+    {
+        try
+        {
+            var artifacts = await provider
+                .GenerateCodeAsync(task.Payload, contextAnalysis, stoppingToken)
+                .ConfigureAwait(false);
+
+            if (!ContainsArtifacts(artifacts))
+            {
+                RegisterGenerationFailure(provider, task, frustrationTracker, "retorno sem arquivos");
+
+                return null;
+            }
+
+            return artifacts;
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (QuotaExhaustedException)
+        {
+            // Cota não é falha do expert: o Circuit Breaker de cota e o fallback do roteador MoE
+            // tratam o caso, e a tarefa volta para a fila sem consumir tentativa do overdrive.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // JSON estrito inválido (retorno que não é o mapa caminho → conteúdo), erro de protocolo
+            // do provedor etc.: falha do expert, contabilizada para a escalada de modelo.
+            RegisterGenerationFailure(provider, task, frustrationTracker, "resposta não parseável", ex);
+
+            return null;
+        }
+    }
+
+    /// <summary>Indica se o retorno do expert traz ao menos um arquivo com conteúdo utilizável.</summary>
+    private static bool ContainsArtifacts(IReadOnlyDictionary<string, string>? artifacts)
+        => artifacts is not null && artifacts.Any(file => !string.IsNullOrWhiteSpace(file.Value));
+
+    /// <summary>
+    /// Incrementa o medidor de frustração e registra a falha da tentativa, informando se o circuito
+    /// desarmou (overdrive) na chamada.
+    /// </summary>
+    private void RegisterGenerationFailure(
+        ILLMProvider provider,
+        AgentTask task,
+        FrustrationTracker frustrationTracker,
+        string reason,
+        Exception? exception = null)
+    {
+        var overdriveTriggered = frustrationTracker.RegistrarFalha();
+
+        logger.LogWarning(
+            exception,
+            "Falha de geração do expert '{ModelName}' na tarefa {TaskId} ({Reason}): falha {Falhas}/{Limite} (overdrive: {Overdrive}).",
+            provider.ModelName,
+            task.Id,
+            reason,
+            frustrationTracker.ContadorAtual,
+            frustrationTracker.LimiteMaximo,
+            overdriveTriggered);
     }
 
     /// <summary>
@@ -360,21 +484,28 @@ public sealed class LuckeOrchestratorWorker(
     /// <remarks>
     /// Falhas do sumarizador são absorvidas de propósito: a entrega já foi commitada, e devolver a
     /// tarefa para a fila (como faria o tratamento de cota do laço) recriaria branch/commit no ciclo
-    /// seguinte. Sem resumo, o corpo do PR recebe a descrição determinística.
+    /// seguinte. Sem resumo — inclusive quando o expert devolve algo que não é o JSON de arquivos e
+    /// o parse falha —, o corpo do PR recebe a descrição determinística.
     /// </remarks>
     private async Task<string> BuildPullRequestSummaryAsync(
         ITaskRouter taskRouter,
         AgentTask task,
-        string generatedCode,
+        IReadOnlyDictionary<string, string> artifacts,
         CancellationToken stoppingToken)
     {
         try
         {
             var summaryProvider = taskRouter.ResolveProvider(TaskComplexity.Baixo);
 
-            var summary = await summaryProvider
-                .GenerateCodeAsync(BuildPullRequestSummaryPrompt(task, generatedCode), string.Empty, stoppingToken)
+            var summaryArtifacts = await summaryProvider
+                .GenerateCodeAsync(BuildPullRequestSummaryPrompt(task, artifacts), string.Empty, stoppingToken)
                 .ConfigureAwait(false);
+
+            // O expert responde sob o mesmo contrato JSON da geração (caminho → conteúdo), então o
+            // resumo é o texto útil devolvido — concatenado quando veio distribuído em mais de um valor.
+            var summary = string.Join(
+                Environment.NewLine,
+                summaryArtifacts.Values.Where(value => !string.IsNullOrWhiteSpace(value)));
 
             return string.IsNullOrWhiteSpace(summary)
                 ? BuildPullRequestDescription(task)
@@ -395,8 +526,33 @@ public sealed class LuckeOrchestratorWorker(
         }
     }
 
-    /// <summary>Prompt de sumarização enviado ao expert rápido para o corpo do pull request.</summary>
-    private static string BuildPullRequestSummaryPrompt(AgentTask task, string generatedCode)
-        => $"Crie um resumo curto em texto puro para a descrição de um Pull Request que implementou esta tarefa: {task.Payload}. "
-            + $"O código gerado foi: {generatedCode}";
+    /// <summary>
+    /// Prompt de sumarização enviado ao expert rápido para o corpo do pull request: traz a tarefa e os
+    /// artefatos gerados, com o conteúdo de cada arquivo limitado por
+    /// <see cref="MaxSummaryContentLengthPerFile"/> — o resumo descreve a mudança, não o código inteiro.
+    /// </summary>
+    private static string BuildPullRequestSummaryPrompt(AgentTask task, IReadOnlyDictionary<string, string> artifacts)
+    {
+        var builder = new StringBuilder()
+            .Append("Crie um resumo curto em texto puro para a descrição de um Pull Request que implementou esta tarefa: ")
+            .Append(task.Payload)
+            .AppendLine()
+            .Append("Arquivos gerados:");
+
+        foreach (var artifact in artifacts)
+        {
+            var content = artifact.Value.Length > MaxSummaryContentLengthPerFile
+                ? artifact.Value[..MaxSummaryContentLengthPerFile]
+                : artifact.Value;
+
+            builder
+                .AppendLine()
+                .AppendLine()
+                .Append("### ")
+                .AppendLine(artifact.Key)
+                .Append(content);
+        }
+
+        return builder.ToString();
+    }
 }

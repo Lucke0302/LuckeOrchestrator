@@ -12,8 +12,16 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.7" />
+    <!-- Microsoft.Extensions.Hosting não é referenciado aqui de propósito: o FrameworkReference do
+         ASP.NET Core (abaixo) já o traz na versão do runtime, e o SDK poda o pacote duplicado (NU1510). -->
     <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.7" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Host HTTP (Kestrel + Minimal APIs): o worker expõe o endpoint do webhook do GitHub sem
+         deixar de ser um BackgroundService. Referência de framework, e não pacote: nada é replicado
+         no publish (o runtime do ASP.NET Core já é compartilhado pelo servidor). -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
   <ItemGroup>

@@ -95,8 +95,8 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     /// <remarks>
     /// O Domain expõe o vetor como <see cref="ReadOnlyMemory{T}"/> e não pode conhecer o pgvector;
     /// por isso a coluna é configurada com um conversor para <c>Pgvector.Vector</c> — o CLR type que
-    /// o provider sabe mapear para <c>vector(d)</c>. Os índices de distância do pgvector (ex.: hnsw)
-    /// não são criados aqui: a base é pequena e um seq scan ordenado por <c>&lt;=&gt;</c> é suficiente.
+    /// o provider sabe mapear para <c>vector(d)</c>. A coluna recebe ainda um índice aproximado
+    /// (HNSW) para que a busca do RAG não degrade para um seq scan ordenado por distância.
     /// </remarks>
     private static void ConfigureCodeDocument(ModelBuilder modelBuilder)
     {
@@ -135,6 +135,17 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
             entity.HasIndex(document => document.FilePath)
                 .IsUnique()
                 .HasDatabaseName("ux_code_documents_file_path");
+
+            // Índice vetorial aproximado (HNSW): sem ele toda busca por similaridade é um seq scan
+            // ordenado por 'embedding <=> @p', inviável a partir de algumas centenas de documentos.
+            // A classe de operadores é a de cosseno (vector_cosine_ops) para casar com a consulta de
+            // SearchSimilarAsync — que ordena por CosineDistance — e permitir que o planner use o
+            // índice em vez de varrer a tabela. Parâmetros (m, ef_construction) ficam no default do
+            // pgvector, adequado ao volume atual do índice da base de código.
+            entity.HasIndex(document => document.Embedding)
+                .HasMethod("hnsw")
+                .HasOperators("vector_cosine_ops")
+                .HasDatabaseName("ix_code_documents_embedding_hnsw");
         });
     }
 }

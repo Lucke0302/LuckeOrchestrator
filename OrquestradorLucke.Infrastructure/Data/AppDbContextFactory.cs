@@ -13,15 +13,17 @@ namespace OrquestradorLucke.Infrastructure.Data;
 /// Comandos (executados da raiz da solução, após <c>dotnet tool update --global dotnet-ef --version 10.0.4</c>):
 /// <code>
 /// $env:ConnectionStrings__DefaultConnection='Host=localhost;Database=lucke;Username=postgres;Password=...'
-/// dotnet ef migrations add &lt;Nome&gt; --project OrquestradorLucke.Infrastructure --output-dir Data/Migrations
-/// dotnet ef migrations add AddCodeDocuments --project OrquestradorLucke.Infrastructure --output-dir Data/Migrations
-/// dotnet ef migrations list  --project OrquestradorLucke.Infrastructure
-/// dotnet ef database update  --project OrquestradorLucke.Infrastructure
-/// dotnet ef migrations script --project OrquestradorLucke.Infrastructure --idempotent -o migration.sql
+/// dotnet ef migrations add &lt;Nome&gt;        --project OrquestradorLucke.Infrastructure --output-dir Data/Migrations
+/// dotnet ef migrations add AddHnswIndex  --project OrquestradorLucke.Infrastructure --output-dir Data/Migrations
+/// dotnet ef migrations list              --project OrquestradorLucke.Infrastructure
+/// dotnet ef database update              --project OrquestradorLucke.Infrastructure
+/// dotnet ef database drop --force        --project OrquestradorLucke.Infrastructure
+/// dotnet ef migrations script            --project OrquestradorLucke.Infrastructure --idempotent -o migration.sql
+/// dotnet ef migrations script &lt;De&gt; &lt;Ate&gt;   --project OrquestradorLucke.Infrastructure --no-build
 /// </code>
-/// A connection string só é exigida para <c>database update</c>/<c>script</c> contra um banco real;
-/// a geração de migrations apenas valida a configuração do provedor. Sem <c>--startup-project</c>, o
-/// EF Core CLI usa esta fábrica e dispensa o host do Worker.
+/// A connection string só é exigida para <c>database update</c>/<c>drop</c>/<c>script</c> contra um banco real
+/// (<c>migrations add</c> e <c>list</c> apenas validam a configuração do provedor quando o banco ainda
+/// não existe). Sem <c>--startup-project</c>, o EF Core CLI usa esta fábrica e dispensa o host do Worker.
 /// </remarks>
 public sealed class AppDbContextFactory : IDesignTimeDbContextFactory<AppDbContext>
 {
