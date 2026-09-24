@@ -23,4 +23,15 @@ public interface IGitHubService
     /// <summary>Abre o pull request da branch informada.</summary>
     /// <returns>URL absoluta do pull request aberto.</returns>
     Task<string> OpenPullRequestAsync(string branchName, string title, string description, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Lê os arquivos C# versionados na branch base do repositório (Git Data API, sem clonar o
+    /// repositório localmente). É a fonte de dados do índice vetorial do RAG.
+    /// </summary>
+    /// <param name="cancellationToken">Token de cancelamento da iteração do worker.</param>
+    /// <returns>
+    /// Dicionário caminho relativo → conteúdo textual dos arquivos <c>.cs</c>. Arquivos que a API
+    /// devolve sem conteúdo (blobs grandes, codificação não textual) são omitidos.
+    /// </returns>
+    Task<Dictionary<string, string>> GetRepositoryCSharpFilesAsync(CancellationToken cancellationToken);
 }

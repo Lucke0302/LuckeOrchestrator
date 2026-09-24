@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Options;
 using OrquestradorLucke.Application.Configuration;
 using OrquestradorLucke.Application.Interfaces;
+using OrquestradorLucke.Application.Services;
 using OrquestradorLucke.Domain;
 using OrquestradorLucke.Infrastructure.Adapters;
 using OrquestradorLucke.Infrastructure.Configuration;
@@ -50,14 +51,54 @@ public static class DependencyInjectionSetup
         // Circuit Breaker de cota: estado único e compartilhado por todo o host.
         services.AddSingleton<IQuotaManager, InMemoryQuotaManager>();
 
-        AddAiStudioExperts(services, ReadResilienceOptions(configuration));
+        var resilience = ReadResilienceOptions(configuration);
+
+        AddAiStudioExperts(services, resilience);
+
+        // Expert de embeddings do RAG: o mesmo adapter do AI Studio, apontado para o modelo de
+        // embeddings do catálogo (que não participa das cadeias MoE) e com Named Client próprio.
+        // A cota é contabilizada por modelo, então um 429 nos embeddings não bloqueia a geração.
+        services
+            .AddHttpClient(ModelCatalog.TextEmbedding004, ConfigureAiStudioClient)
+            .AddTransientHttpErrorPolicy(policyBuilder => CreateTransientRetryPolicy(policyBuilder, resilience));
+
+        services.AddTransient<IEmbeddingProvider>(
+            serviceProvider => CreateAiStudioExpert(serviceProvider, ModelCatalog.TextEmbedding004));
 
         // Serviços resolvidos a cada iteração (escopo do laço do BackgroundService).
         services.AddScoped<IGitHubService, GitHubAdapter>();
         services.AddScoped<IAgentTaskRepository, AgentTaskRepository>();
         services.AddScoped<ITaskRouter, MoETaskRouter>();
 
+        // RAG: índice vetorial (pgvector) e indexador incremental da base de código.
+        services.AddScoped<ICodeContextRepository, CodeContextRepository>();
+        services.AddScoped<CodebaseIndexerService>();
+
         return services;
+    }
+
+    /// <summary>
+    /// Valida o grafo de injeção de dependência antes de o host subir: dependências não registradas e
+    /// serviços Scoped resolvidos a partir da raiz falham no start do daemon, não na primeira iteração
+    /// do laço.
+    /// </summary>
+    /// <remarks>
+    /// O host só habilita essa checagem automaticamente em Development; sob systemd (Production) o
+    /// erro apareceria apenas no journal. Nada é instanciado — as call sites são validadas e o
+    /// provider criado aqui é descartado na sequência, sem relação com o container do host.
+    /// </remarks>
+    /// <param name="services">Coleção de serviços composta por <see cref="AddOrchestrator"/>.</param>
+    public static void ValidateOrchestratorComposition(IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        services
+            .BuildServiceProvider(new ServiceProviderOptions
+            {
+                ValidateScopes = true,
+                ValidateOnBuild = true
+            })
+            .Dispose();
     }
 
     /// <summary>
@@ -97,7 +138,12 @@ public static class DependencyInjectionSetup
     /// Cria o expert do modelo reaproveitando BaseUrl/ApiKey/timeouts da configuração (IOptions) e
     /// sobrescrevendo apenas o identificador do modelo.
     /// </summary>
-    private static ILLMProvider CreateAiStudioExpert(IServiceProvider serviceProvider, string modelName)
+    /// <remarks>
+    /// O tipo concreto é devolvido (em vez de <see cref="ILLMProvider"/>) porque o mesmo adapter
+    /// atende às duas operações do AI Studio: geração de conteúdo (MoE) e embeddings (RAG) — o
+    /// registro de <see cref="IEmbeddingProvider"/> reutiliza esta fábrica com o modelo de embeddings.
+    /// </remarks>
+    private static GoogleAiStudioAdapter CreateAiStudioExpert(IServiceProvider serviceProvider, string modelName)
     {
         var httpClient = serviceProvider.GetRequiredService<IHttpClientFactory>().CreateClient(modelName);
         var template = serviceProvider.GetRequiredService<IOptions<AiStudioOptions>>().Value;

@@ -1,3 +1,4 @@
+using System.Text;
 using Microsoft.Extensions.Options;
 using Octokit;
 using OrquestradorLucke.Application.Interfaces;
@@ -24,6 +25,9 @@ public sealed class GitHubAdapter : IGitHubService
 
     /// <summary>Modo de arquivo regular na árvore do Git ("100644").</summary>
     private const string FileMode = "100644";
+
+    /// <summary>Extensão dos arquivos indexados pelo RAG da base de código.</summary>
+    private const string CSharpFileExtension = ".cs";
 
     private readonly GitHubOptions _options;
 
@@ -174,6 +178,69 @@ public sealed class GitHubAdapter : IGitHubService
             .ConfigureAwait(false);
 
         return pullRequest.HtmlUrl;
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// A versão 14 do Octokit não expõe overloads com <see cref="CancellationToken"/> nas rotas de
+    /// Git; por isso o token é validado antes da leitura da árvore e a cada arquivo baixado. Quando
+    /// o GitHub trunca a árvore (<c>TreeResponse.Truncated</c>, repositórios muito grandes), o
+    /// índice recebe apenas os arquivos retornados.
+    /// </remarks>
+    public async Task<Dictionary<string, string>> GetRepositoryCSharpFilesAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        EnsureRepositoryConfiguration();
+
+        var owner = _options.Owner;
+        var repository = _options.Repository;
+
+        // Ponto de partida: o último commit da branch base (a mesma referência das branches do agente).
+        var baseReference = await Client.Git.Reference
+            .Get(owner, repository, HeadRefPrefix + _options.BaseBranch)
+            .ConfigureAwait(false);
+
+        // Uma única chamada devolve caminho e SHA de toda a árvore (recursiva), evitando N requests
+        // de listagem; o conteúdo de cada blob continua exigindo um download individual.
+        var tree = await Client.Git.Tree
+            .GetRecursive(owner, repository, baseReference.Object.Sha)
+            .ConfigureAwait(false);
+
+        var files = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        foreach (var item in tree.Tree)
+        {
+            if (item.Type != TreeType.Blob ||
+                !item.Path.EndsWith(CSharpFileExtension, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var blob = await Client.Git.Blob
+                .Get(owner, repository, item.Sha)
+                .ConfigureAwait(false);
+
+            // Blobs acima do limite da API (e conteúdo não textual) voltam sem base64: sem texto não
+            // há o que indexar, então o arquivo é ignorado neste ciclo.
+            if (blob.Encoding != EncodingType.Utf8 || string.IsNullOrWhiteSpace(blob.Content))
+            {
+                continue;
+            }
+
+            var buffer = new byte[blob.Content.Length];
+
+            if (!Convert.TryFromBase64String(blob.Content, buffer, out var written))
+            {
+                continue;
+            }
+
+            files[item.Path] = Encoding.UTF8.GetString(buffer, 0, written);
+        }
+
+        return files;
     }
 
     /// <summary>Valida os valores vindos de configuração (IOptions) antes de sair para a rede.</summary>

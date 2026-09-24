@@ -42,6 +42,18 @@ public static class ModelCatalog
     public const string Gemini3FlashPreview = "models/gemini-3-flash-preview";
 
     /// <summary>
+    /// Modelo de embeddings do RAG (base de código). Não participa das cadeias MoE: não gera código,
+    /// apenas vetores que alimentam a coluna <c>vector</c> de <c>code_documents</c>.
+    /// </summary>
+    public const string TextEmbedding004 = "models/text-embedding-004";
+
+    /// <summary>
+    /// Dimensão dos vetores produzidos por <see cref="TextEmbedding004"/> — é o <c>d</c> da coluna
+    /// <c>vector(d)</c> do pgvector e precisa ser fixo para o índice e as consultas casarem.
+    /// </summary>
+    public const int EmbeddingDimensions = 768;
+
+    /// <summary>
     /// Cadeias de prioridade por complexidade; a ordem define o fallback dentro da complexidade
     /// (primeiro modelo com cota ativa vence).
     /// </summary>

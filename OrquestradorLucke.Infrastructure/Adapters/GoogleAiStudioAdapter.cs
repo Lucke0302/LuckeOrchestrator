@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Text.Json;
 using Microsoft.Extensions.Options;
 using OrquestradorLucke.Application.Interfaces;
 using OrquestradorLucke.Domain;
@@ -9,19 +10,30 @@ using OrquestradorLucke.Infrastructure.Models;
 namespace OrquestradorLucke.Infrastructure.Adapters;
 
 /// <summary>
-/// Adapter do Google AI Studio (um dos experts do padrão MoE). Envia o prompt no formato
-/// <c>generateContent</c>, extrai apenas o artefato útil da resposta — descartando o
-/// Chain-of-Thought que os modelos Gemma imprimem antes do payload — e aciona o Circuit Breaker
-/// de cota quando o provedor responde 429 (Too Many Requests).
+/// Adapter do Google AI Studio: um dos experts do padrão MoE (endpoint <c>generateContent</c>) e
+/// também o provedor de embeddings do RAG (endpoint <c>embedContent</c>). Extrai apenas o artefato
+/// útil da resposta — descartando o Chain-of-Thought que os modelos Gemma imprimem antes do payload
+/// — e aciona o Circuit Breaker de cota quando o provedor responde 429 (Too Many Requests).
 /// </summary>
+/// <remarks>
+/// Um único adapter cobre as duas operações porque o tratamento de cota (429), falha transitória
+/// (5xx/408 para o retry do Polly) e autenticação é idêntico; o que muda é o endpoint e o
+/// identificador de modelo — no RAG o registro aponta para o modelo de embeddings do catálogo.
+/// </remarks>
 public sealed class GoogleAiStudioAdapter(
     HttpClient httpClient,
     IOptions<AiStudioOptions> options,
-    IQuotaManager quotaManager) : ILLMProvider, IDisposable
+    IQuotaManager quotaManager) : ILLMProvider, IEmbeddingProvider, IDisposable
 {
     private const string ApiKeyHeaderName = "x-goog-api-key";
     private const string ModelsPathSegment = "models/";
     private const string GenerateContentOperation = ":generateContent";
+    private const string EmbedContentOperation = ":embedContent";
+
+    private static readonly JsonSerializerOptions ResponseSerializerOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
 
     private readonly AiStudioOptions _options = options.Value;
     private readonly IQuotaManager _quotaManager = quotaManager;
@@ -38,6 +50,37 @@ public sealed class GoogleAiStudioAdapter(
     public Task<string> EvaluateErrorAsync(string payload, string generatedCode, string errorMessage, CancellationToken cancellationToken)
         => SendPromptAsync("Explique a causa da falha e proponha a correção.", $"{errorMessage}{Environment.NewLine}{generatedCode}{Environment.NewLine}{payload}", cancellationToken);
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// Usa o endpoint <c>models/{ModelName}:embedContent</c>. Quando o adapter é registrado como
+    /// provedor de embeddings, <see cref="ModelName"/> aponta para o modelo de embeddings do
+    /// <c>ModelCatalog</c> — que não participa das cadeias MoE — e um eventual 429 bloqueia apenas
+    /// esse modelo no Circuit Breaker de cota, preservando o rodízio dos experts de geração.
+    /// </remarks>
+    public async Task<ReadOnlyMemory<float>> GenerateEmbeddingAsync(string text, CancellationToken cancellationToken)
+    {
+        EnsureConfiguration();
+        ArgumentNullException.ThrowIfNull(text);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, BuildRequestUri(EmbedContentOperation))
+        {
+            Content = JsonContent.Create(new
+            {
+                model = QualifiedModelName,
+                content = new
+                {
+                    parts = new[] { new { text } }
+                }
+            })
+        };
+
+        request.Headers.TryAddWithoutValidation(ApiKeyHeaderName, _options.ApiKey);
+
+        var apiResponse = await SendAsync(request, cancellationToken).ConfigureAwait(false);
+
+        return ExtractEmbeddingValues(apiResponse);
+    }
+
     /// <summary>
     /// Descarta o <see cref="HttpClient"/> obtido do <c>IHttpClientFactory</c> (o pool de handlers
     /// permanece compartilhado, portanto não há esgotamento de sockets).
@@ -49,7 +92,7 @@ public sealed class GoogleAiStudioAdapter(
     {
         EnsureConfiguration();
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, BuildRequestUri())
+        using var request = new HttpRequestMessage(HttpMethod.Post, BuildRequestUri(GenerateContentOperation))
         {
             Content = JsonContent.Create(new
             {
@@ -62,6 +105,22 @@ public sealed class GoogleAiStudioAdapter(
 
         request.Headers.TryAddWithoutValidation(ApiKeyHeaderName, _options.ApiKey);
 
+        var apiResponse = await SendAsync(request, cancellationToken).ConfigureAwait(false);
+
+        return ExtractPayload(apiResponse);
+    }
+
+    /// <summary>
+    /// Envia a requisição e devolve o corpo da resposta, centralizando o tratamento comum aos
+    /// endpoints do Google AI Studio: Circuit Breaker de cota no 429, falha transitória (5xx/408)
+    /// para o Polly repetir e erro definitivo nos demais status.
+    /// </summary>
+    /// <param name="request">Requisição já montada e autenticada com a chave de API.</param>
+    /// <param name="cancellationToken">Token de cancelamento da iteração do worker.</param>
+    /// <exception cref="QuotaExhaustedException">Quando o provedor responde 429 (cota esgotada).</exception>
+    /// <exception cref="HttpRequestException">Quando a falha é transitória (5xx/408) e o Polly deve repetir.</exception>
+    private async Task<string> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
         using var response = await httpClient
             .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
             .ConfigureAwait(false);
@@ -94,9 +153,7 @@ public sealed class GoogleAiStudioAdapter(
         // Demais erros (400/401/403/404 etc.) não são transitórios: falham sem retry.
         response.EnsureSuccessStatusCode();
 
-        var apiResponse = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-
-        return ExtractPayload(apiResponse);
+        return await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Valida os valores vindos de configuração (IOptions) antes de sair para a rede.</summary>
@@ -118,21 +175,32 @@ public sealed class GoogleAiStudioAdapter(
         }
     }
 
+    /// <summary>Identificador do modelo sem o prefixo <c>models/</c> (aceita as duas formas).</summary>
+    private string ModelRouteName
+    {
+        get
+        {
+            var model = _options.ModelName.Trim().TrimStart('/');
+
+            return model.StartsWith(ModelsPathSegment, StringComparison.OrdinalIgnoreCase)
+                ? model[ModelsPathSegment.Length..]
+                : model;
+        }
+    }
+
     /// <summary>
-    /// Monta o endpoint relativo <c>{ApiVersion}/models/{model}:generateContent</c>. Aceita tanto
+    /// Identificador do modelo com o prefixo <c>models/</c> — formato exigido no campo <c>model</c>
+    /// do corpo do <c>embedContent</c>.
+    /// </summary>
+    private string QualifiedModelName => ModelsPathSegment + ModelRouteName;
+
+    /// <summary>
+    /// Monta o endpoint relativo <c>{ApiVersion}/models/{model}{operation}</c>. Aceita tanto
     /// <c>models/gemini-x</c> quanto <c>gemini-x</c>, evitando duplicar o prefixo <c>models/</c>.
     /// </summary>
-    private string BuildRequestUri()
-    {
-        var model = _options.ModelName.Trim().TrimStart('/');
-
-        if (model.StartsWith(ModelsPathSegment, StringComparison.OrdinalIgnoreCase))
-        {
-            model = model[ModelsPathSegment.Length..];
-        }
-
-        return $"{_options.ApiVersion.Trim().Trim('/')}/{ModelsPathSegment}{model}{GenerateContentOperation}";
-    }
+    /// <param name="operation">Operação do endpoint (ex.: <c>:generateContent</c>, <c>:embedContent</c>).</param>
+    private string BuildRequestUri(string operation)
+        => $"{_options.ApiVersion.Trim().Trim('/')}/{ModelsPathSegment}{ModelRouteName}{operation}";
 
     /// <summary>Indica erro transitório (5xx ou 408), que deve ser repetido pela política do Polly.</summary>
     private static bool IsTransientFailure(HttpStatusCode statusCode)
@@ -164,5 +232,38 @@ public sealed class GoogleAiStudioAdapter(
         return AiStudioResponseReader.IsJsonDocument(apiResponse)
             ? string.Empty
             : AiStudioResponseReader.ExtractStructuredPayload(apiResponse);
+    }
+
+    /// <summary>
+    /// Lê o envelope do <c>embedContent</c> e devolve os valores do vetor.
+    /// </summary>
+    /// <param name="apiResponse">Corpo bruto devolvido pelo provedor.</param>
+    /// <returns>
+    /// Vetor do modelo; <see cref="ReadOnlyMemory{T}.Empty"/> quando o corpo não é o envelope
+    /// esperado ou não traz <c>embedding.values</c> — o chamador decide se descarta o documento.
+    /// </returns>
+    private static ReadOnlyMemory<float> ExtractEmbeddingValues(string apiResponse)
+    {
+        if (string.IsNullOrWhiteSpace(apiResponse))
+        {
+            return ReadOnlyMemory<float>.Empty;
+        }
+
+        EmbeddingResponse? envelope;
+
+        try
+        {
+            envelope = JsonSerializer.Deserialize<EmbeddingResponse>(apiResponse, ResponseSerializerOptions);
+        }
+        catch (JsonException)
+        {
+            return ReadOnlyMemory<float>.Empty;
+        }
+
+        var values = envelope?.Embedding?.Values;
+
+        return values is { Count: > 0 }
+            ? values.ToArray()
+            : ReadOnlyMemory<float>.Empty;
     }
 }

@@ -1,12 +1,14 @@
 using Microsoft.EntityFrameworkCore;
 using OrquestradorLucke.Domain;
+using OrquestradorLucke.Infrastructure.Configuration;
+using Pgvector;
 
 namespace OrquestradorLucke.Infrastructure.Data;
 
 /// <summary>
-/// Contexto do EF Core para a persistência de tarefas no PostgreSQL, com o suporte vetorial do
-/// pgvector habilitado para os embeddings dos modelos do roteador MoE. Vive na Infrastructure:
-/// é o único ponto do sistema que conhece o EF Core.
+/// Contexto do EF Core para a persistência de tarefas e do índice vetorial no PostgreSQL, com o
+/// suporte do pgvector habilitado. Vive na Infrastructure: é o único ponto do sistema que conhece o
+/// EF Core.
 /// </summary>
 public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
 {
@@ -16,16 +18,20 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     /// <summary>Tarefas do orquestrador (fila persistida em <c>agent_tasks</c>).</summary>
     public DbSet<AgentTask> AgentTasks => Set<AgentTask>();
 
+    /// <summary>Documentos de código indexados para o RAG (tabela <c>code_documents</c>).</summary>
+    public DbSet<CodeDocument> CodeDocuments => Set<CodeDocument>();
+
     /// <summary>Configura a extensão vetorial e o mapeamento explícito das entidades.</summary>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
 
         // Suporte vetorial do PostgreSQL: a migration emite CREATE EXTENSION IF NOT EXISTS vector,
-        // pré-requisito para as colunas de embedding usadas na busca semântica.
+        // pré-requisito para a coluna de embedding do índice do RAG.
         modelBuilder.HasPostgresExtension("vector");
 
         ConfigureAgentTask(modelBuilder);
+        ConfigureCodeDocument(modelBuilder);
     }
 
     /// <summary>
@@ -80,6 +86,55 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
             // Índice que atende o dequeue: status Pendente ordenado por criado_em.
             entity.HasIndex(task => new { task.Status, task.CriadoEm })
                 .HasDatabaseName("ix_agent_tasks_status_criado_em");
+        });
+    }
+
+    /// <summary>
+    /// Mapeamento explícito de <see cref="CodeDocument"/> (índice do RAG).
+    /// </summary>
+    /// <remarks>
+    /// O Domain expõe o vetor como <see cref="ReadOnlyMemory{T}"/> e não pode conhecer o pgvector;
+    /// por isso a coluna é configurada com um conversor para <c>Pgvector.Vector</c> — o CLR type que
+    /// o provider sabe mapear para <c>vector(d)</c>. Os índices de distância do pgvector (ex.: hnsw)
+    /// não são criados aqui: a base é pequena e um seq scan ordenado por <c>&lt;=&gt;</c> é suficiente.
+    /// </remarks>
+    private static void ConfigureCodeDocument(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<CodeDocument>(entity =>
+        {
+            entity.ToTable("code_documents");
+            entity.HasKey(document => document.Id).HasName("pk_code_documents");
+
+            // O identificador é gerado pelo domínio (Guid.NewGuid()), não pelo banco.
+            entity.Property(document => document.Id)
+                .HasColumnName("id")
+                .ValueGeneratedNever();
+
+            entity.Property(document => document.FilePath)
+                .HasColumnName("file_path")
+                .HasMaxLength(512)
+                .IsRequired();
+
+            entity.Property(document => document.ContentHash)
+                .HasColumnName("content_hash")
+                .HasMaxLength(64)
+                .IsRequired();
+
+            entity.Property(document => document.Content)
+                .HasColumnName("content")
+                .IsRequired();
+
+            entity.Property(document => document.Embedding)
+                .HasColumnName("embedding")
+                .HasColumnType($"vector({ModelCatalog.EmbeddingDimensions})")
+                .HasConversion(
+                    embedding => new Vector(embedding.ToArray()),
+                    vector => new ReadOnlyMemory<float>(vector.ToArray()));
+
+            // Chave natural do índice: o upsert procura o documento pelo caminho do arquivo.
+            entity.HasIndex(document => document.FilePath)
+                .IsUnique()
+                .HasDatabaseName("ux_code_documents_file_path");
         });
     }
 }

@@ -22,4 +22,11 @@ public sealed class OrchestratorWorkerOptions
     /// pelo expert. É o conteúdo enviado em <c>CommitChangesAsync</c>.
     /// </summary>
     public string GeneratedArtifactPath { get; set; } = "Feature.cs";
+
+    /// <summary>
+    /// Cadência do indexador do RAG, em minutos. Cada ciclo relê a árvore da branch base no GitHub,
+    /// mas só embute os arquivos novos/alterados — um intervalo curto demais só consumiria cota de
+    /// API do GitHub sem ganho de contexto.
+    /// </summary>
+    public int IndexingIntervalMinutes { get; set; } = 15;
 }

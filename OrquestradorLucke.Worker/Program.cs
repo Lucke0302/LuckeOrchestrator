@@ -8,8 +8,13 @@ var builder = Host.CreateApplicationBuilder(args);
 builder.Services.AddSystemd();
 
 // Composição da injeção de dependência: IOptions, um expert do Google AI Studio por modelo do
-// catálogo MoE, Circuit Breaker de cota (Singleton) e política de resiliência (Polly).
+// catálogo MoE, o expert de embeddings do RAG, Circuit Breaker de cota (Singleton), política de
+// resiliência (Polly) e a persistência PostgreSQL/pgvector.
 builder.Services.AddOrchestrator(builder.Configuration);
+
+// Valida o grafo de DI antes de subir: dependência não registrada (ou serviço Scoped consumido pela
+// raiz) falha aqui, no start do daemon, em vez de aparecer só no journal da primeira iteração.
+DependencyInjectionSetup.ValidateOrchestratorComposition(builder.Services);
 
 builder.Services.AddHostedService<LuckeOrchestratorWorker>();
 
