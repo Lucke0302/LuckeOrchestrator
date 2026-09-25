@@ -379,6 +379,12 @@ automática da tarefa …` + payload): a entrega já commitada não é desfeita 
   base; sem árvore devolvida, o método lança `InvalidOperationException` em vez de partir do vazio.
 - **Consistência eventual do GitHub:** a leitura da referência/commit base repete em até 5 tentativas
   com 1s de intervalo, logando `LogWarning` por tentativa, antes de propagar o `404`.
+- **Referência atualizada com force:** o `PATCH git/refs` de `CommitChangesAsync` envia
+  `ReferenceUpdate(newCommit.Sha, force: true)`. Em retry/overdrive a branch `feat/task-{id}` pode já
+  ter commit de uma tentativa anterior e o commit novo nasce de outro pai — sem o force o GitHub
+  responde `422 Update is not a fast forward` e derruba a entrega. Como a branch é temporária,
+  exclusiva da tarefa e gerida só pelo agente, o ponteiro é simplesmente reposicionado no commit novo
+  (o PR passa a refletir o último ciclo).
 - **Trilha do Octokit:** criação de branch, commit (blobs, árvore, referência) e abertura do PR logam
   `LogInformation` com os SHAs/caminhos de cada etapa e `LogError` + rethrow em qualquer falha — o log
   mostra exatamente onde o fluxo parou.
