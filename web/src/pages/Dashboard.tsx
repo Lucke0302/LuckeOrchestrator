@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import type { KeyboardEvent } from 'react'
 import axios from 'axios'
 import {
   AlertCircle,
@@ -9,14 +10,15 @@ import {
   Loader2,
   LogOut,
   RefreshCw,
+  Send,
   Terminal,
   X,
 } from 'lucide-react'
 import { ChatMessage } from '../components/ChatMessage'
-import type { ChatRole } from '../components/ChatMessage'
 import { Skeleton } from '../components/ui/Skeleton'
 import { useAuth } from '../contexts/AuthContext'
 import { MAX_LOG_ENTRIES, useLogStream } from '../hooks/useLogStream'
+import { sendMessage } from '../services/ChatService'
 import { acceptTask, getTasks, rejectTask } from '../services/TaskService'
 import type { AgentTaskStatus, Task, TaskComplexity } from '../services/TaskService'
 
@@ -153,33 +155,37 @@ function isReviewable(status: AgentTaskStatus): boolean {
   return status === 'Concluida' || status === 'Falhou'
 }
 
-/** Item da thread do chat (o envio de mensagens depende do endpoint de chat do agente). */
-type ChatThreadItem = {
+/**
+ * Item da thread do chat: `user` é o que o operador digitou; `agent` é a resposta do modelo (ou o
+ * aviso de falha). Só o `agent` passa pelo `ChatMessage`, que separa o bloco de raciocínio.
+ */
+type ChatEntry = {
   id: string
-  author: string
-  role: ChatRole
-  timestamp: string
+  role: 'user' | 'agent'
   content: string
 }
 
 /**
- * Mensagem fixa de abertura, até o daemon publicar o endpoint de chat do agente. Serve de prova viva
- * do componente `ChatMessage`: o bloco de raciocínio fica atrás do `<details>`.
+ * Thread inicial do painel: dá contexto ao operador antes do primeiro envio e serve de prova viva do
+ * `ChatMessage` — o raciocínio que o motor devolve em `<think>` fica atrás do `<details>`.
  */
-function createWelcomeThread(): ChatThreadItem[] {
-  return [
-    {
-      id: 'boas-vindas',
-      author: 'Orquestrador',
-      role: 'agente',
-      timestamp: clockFormatter.format(new Date()),
-      content: [
-        'Chat do agente em preparação: as mensagens do operador e as respostas do modelo aparecem aqui assim que o daemon expuser o endpoint de chat.',
-        '<think>O raciocínio do modelo vem embrulhado nas tags de pensamento e o painel o guarda em um bloco retrátil — assim o operador audita o caminho da resposta sem perder a leitura da conversa.</think>',
-        'Enquanto isso, o terminal de logs ao lado é a fonte em tempo real do que o daemon está fazendo.',
-      ].join('\n\n'),
-    },
-  ]
+const INITIAL_CHAT_MESSAGES: ChatEntry[] = [
+  {
+    id: 'boas-vindas',
+    role: 'agent',
+    content:
+      'Olá! Sou o agente do Orquestrador Lucke. Descreva o que você precisa e eu respondo por aqui; o meu raciocínio fica no bloco retrátil "Pensamentos do Agente".',
+  },
+]
+
+/** Sequência local das mensagens: o endpoint não devolve id por mensagem — a thread é do painel. */
+let chatEntrySequence = 0
+
+/** Identificador único da entrada (o React usa como `key` e nada é reaproveitado entre envios). */
+function createChatEntryId(role: ChatEntry['role']): string {
+  chatEntrySequence += 1
+
+  return `${role}-${chatEntrySequence}`
 }
 
 /** Desfecho de uma revisão aplicada, mostrado no topo da coluna de tarefas. */
@@ -201,7 +207,11 @@ function Dashboard() {
   // Tarefa com o formulário de rejeição aberto e o motivo digitado nele.
   const [rejectingTaskId, setRejectingTaskId] = useState<string | null>(null)
   const [rejectReason, setRejectReason] = useState('')
-  const [thread] = useState<ChatThreadItem[]>(createWelcomeThread)
+  // Chat do agente: histórico da conversa, rascunho do operador e o lock do envio em voo.
+  const [chatMessages, setChatMessages] = useState<ChatEntry[]>(INITIAL_CHAT_MESSAGES)
+  const [chatInput, setChatInput] = useState('')
+  const [isChatSending, setIsChatSending] = useState(false)
+  const chatEndRef = useRef<HTMLDivElement | null>(null)
   const terminalRef = useRef<HTMLDivElement | null>(null)
 
   // Cada carga da fila é um pedido identificado: `0` é a carga inicial e cada clique em Atualizar
@@ -261,6 +271,61 @@ function Dashboard() {
       terminal.scrollTop = terminal.scrollHeight
     }
   }, [logs])
+
+  // A conversa acompanha o fim: cada mensagem nova (do operador ou do agente) rola até o marcador.
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [chatMessages])
+
+  /**
+   * Envia o rascunho ao motor de chat (`POST /api/chat`): a mensagem do operador entra no histórico na
+   * hora (eco otimista), o input é limpo e o lock impede envio duplo. A resposta do modelo — ou o aviso
+   * de falha — entra como uma nova entrada do agente.
+   */
+  async function handleSendChatMessage() {
+    const message = chatInput.trim()
+
+    if (message.length === 0 || isChatSending) {
+      return
+    }
+
+    setChatMessages((current) => [
+      ...current,
+      { id: createChatEntryId('user'), role: 'user', content: message },
+    ])
+    setChatInput('')
+    setIsChatSending(true)
+
+    try {
+      const response = await sendMessage(message)
+
+      setChatMessages((current) => [
+        ...current,
+        { id: createChatEntryId('agent'), role: 'agent', content: response },
+      ])
+    } catch (error) {
+      setChatMessages((current) => [
+        ...current,
+        {
+          id: createChatEntryId('agent'),
+          role: 'agent',
+          content: `⚠️ Falha ao falar com o agente: ${resolveApiError(error, 'tente novamente em instantes.')}`,
+        },
+      ])
+    } finally {
+      setIsChatSending(false)
+    }
+  }
+
+  /** Enter envia; Shift+Enter quebra a linha (e o IME em composição nunca dispara o envio). */
+  function handleChatInputKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) {
+      return
+    }
+
+    event.preventDefault()
+    void handleSendChatMessage()
+  }
 
   /**
    * Aplica uma revisão (aceitar/rejeitar), troca o card pela tarefa que a API devolveu e libera a UI.
@@ -435,7 +500,7 @@ function Dashboard() {
           </div>
         </section>
 
-        {/* Coluna 2 — Chat do agente (base): transporte de mensagens ainda não existe no daemon. */}
+        {/* Coluna 2 — Chat do agente: conversa com o motor de chat do Gemini (`POST /api/chat`). */}
         <section
           aria-label="Chat do agente"
           className="flex min-h-[320px] flex-col overflow-hidden rounded-xl border border-lucke-blue-soft/40 bg-lucke-blue-dark lg:min-h-0"
@@ -445,32 +510,73 @@ function Dashboard() {
               <Bot className="text-lucke-blue-light" size={18} aria-hidden="true" />
               <h2 className="text-sm font-semibold text-white">Chat do Agente</h2>
             </div>
-            <span className="rounded-full border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 text-[11px] text-amber-300">
-              Em preparação
+            <span className="font-mono text-[11px] text-lucke-blue-lighter/60">
+              {chatMessages.length} mensagem(ns)
             </span>
           </header>
 
           <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
-            {thread.map((item) => (
-              <ChatMessage
-                key={item.id}
-                author={item.author}
-                content={item.content}
-                role={item.role}
-                timestamp={item.timestamp}
-              />
-            ))}
+            {chatMessages.map((entry) =>
+              entry.role === 'user' ? (
+                // Fala do operador: balão simples alinhado à direita (o raciocínio só existe do lado do agente).
+                <div key={entry.id} className="flex justify-end">
+                  <p className="max-w-[85%] whitespace-pre-wrap rounded-xl border border-lucke-blue/40 bg-lucke-blue-soft px-3 py-2 text-sm text-white">
+                    {entry.content}
+                  </p>
+                </div>
+              ) : (
+                // Resposta do motor (ou o aviso de falha): o `ChatMessage` separa as tags de pensamento.
+                <ChatMessage
+                  key={entry.id}
+                  author="Orquestrador"
+                  content={entry.content}
+                  role="agente"
+                />
+              ),
+            )}
+
+            {isChatSending && (
+              <p
+                role="status"
+                className="flex items-center gap-2 px-1 text-xs text-lucke-blue-lighter/60"
+              >
+                <Loader2 className="animate-spin" size={14} aria-hidden="true" />
+                O agente está respondendo…
+              </p>
+            )}
+
+            {/* Marcador invisível: o efeito de auto-scroll rola o painel até ele a cada mensagem nova. */}
+            <div ref={chatEndRef} aria-hidden="true" />
           </div>
 
           <div className="shrink-0 border-t border-lucke-blue-soft/40 p-3">
             <textarea
               rows={2}
-              disabled
-              placeholder="Envio de mensagens chega com o endpoint de chat do agente."
-              className="w-full resize-none rounded-xl border border-lucke-blue-soft/40 bg-lucke-blue-darker px-3 py-2 text-sm text-white placeholder:text-lucke-blue-lighter/40 disabled:cursor-not-allowed disabled:opacity-60"
+              value={chatInput}
+              disabled={isChatSending}
+              onChange={(event) => setChatInput(event.target.value)}
+              onKeyDown={handleChatInputKeyDown}
+              placeholder="Descreva a tarefa ou pergunte ao agente. Enter envia; Shift+Enter quebra a linha."
+              className="w-full resize-none rounded-xl border border-lucke-blue-soft/40 bg-lucke-blue-darker px-3 py-2 text-sm text-white placeholder:text-lucke-blue-lighter/40 focus:border-lucke-blue-light focus:outline-none focus:ring-2 focus:ring-lucke-blue/40 disabled:cursor-not-allowed disabled:opacity-60"
             />
+            <div className="mt-2 flex justify-end">
+              <button
+                type="button"
+                onClick={() => void handleSendChatMessage()}
+                disabled={isChatSending || chatInput.trim().length === 0}
+                className="flex items-center gap-1.5 rounded-lg bg-lucke-blue px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-lucke-blue-light focus:outline-none focus:ring-2 focus:ring-lucke-blue/50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isChatSending ? (
+                  <Loader2 className="animate-spin" size={14} aria-hidden="true" />
+                ) : (
+                  <Send size={14} aria-hidden="true" />
+                )}
+                Enviar
+              </button>
+            </div>
           </div>
         </section>
+
 
         {/* Coluna 3 — Terminal de logs em tempo real (hub SignalR `/hubs/logs`). */}
         <section

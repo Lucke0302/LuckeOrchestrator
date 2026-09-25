@@ -64,11 +64,12 @@ public sealed class GeminiChatService(
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
 
     /// <summary>
-    /// Instrução de sistema que fixa o contrato das tags de raciocínio. É o que permite o painel
-    /// separar o Chain-of-Thought da resposta final sem heurística de parse no cliente.
+    /// Instrução de sistema (em inglês, mais obedecida pelos modelos) que fixa o contrato das tags de
+    /// raciocínio. É o que permite o painel separar o Chain-of-Thought da resposta final sem heurística
+    /// de parse no cliente: nada de raciocínio fora de <c>&lt;think&gt;</c> e resposta final em português.
     /// </summary>
     private const string ChainOfThoughtInstruction =
-        "Você deve obrigatoriamente colocar todo o seu processo de raciocínio passo a passo dentro de tags <think> e </think>. A sua resposta final para o usuário deve ficar fora dessas tags.";
+        "You are a helpful AI assistant. You MUST process your thoughts step-by-step. ALL your internal reasoning, planning, and bullet points MUST be strictly enclosed within <think> and </think> XML tags. You must NEVER output reasoning outside of these tags. Immediately after the </think> tag, you must output your final, polished response directly to the user in Portuguese.";
 
     private readonly IConfiguration _configuration = configuration;
     private readonly ILogger<GeminiChatService> _logger = logger;
