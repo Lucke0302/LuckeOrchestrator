@@ -258,14 +258,21 @@ public sealed class GitHubAdapter : IGitHubService
                     currentCommit.Parents.Select(parent => parent.Sha)))
                 .ConfigureAwait(false);
 
+            // Fast-forward forçado: a referência é reposicionada no commit novo mesmo que ele não seja
+            // descendente do atual. Cenário real de retry/overdrive: a branch feat/task-{id} já tinha
+            // sido commitada numa tentativa anterior e o novo commit nasce de outro pai (base relida),
+            // então o PATCH responderia 422 "Update is not a fast forward". Como essas branches são
+            // temporárias, exclusivas da tarefa e geridas só pelo agente, sobrescrever o ponteiro é o
+            // comportamento desejado — o PR passa a refletir os arquivos do último ciclo, sem duplicar
+            // o conteúdo já versionado por uma tentativa anterior.
             await Client.Git.Reference
-                .Update(owner, repository, headReference, new ReferenceUpdate(newCommit.Sha))
+                .Update(owner, repository, headReference, new ReferenceUpdate(newCommit.Sha, force: true))
                 .ConfigureAwait(false);
 
             // Auditoria da entrega: blobs, árvore e commit com o SHA de cada etapa ficam no log — é
             // este rastro que mostra onde o fluxo parou quando a branch é criada e nada é commitado.
             _logger.LogInformation(
-                "Commit {CommitSha} publicado na branch '{Branch}' de {Owner}/{Repository}: {FileCount} arquivo(s), árvore {TreeSha} (base {BaseTreeSha}).",
+                "Commit {CommitSha} publicado na branch '{Branch}' de {Owner}/{Repository} (referência atualizada com force): {FileCount} arquivo(s), árvore {TreeSha} (base {BaseTreeSha}).",
                 newCommit.Sha,
                 branchName,
                 owner,
