@@ -7,9 +7,9 @@ namespace OrquestradorLucke.Worker.Services;
 
 /// <summary>
 /// Motor de chat do painel: envia a mensagem do operador ao endpoint <c>generateContent</c> do Google
-/// AI Studio e força o modelo a responder em JSON estruturado
-/// (<c>{ "thoughts": "...", "answer": "..." }</c>) — o C# converte isso nas tags
-/// <c>&lt;think&gt;</c> que o painel isola, mostrando a resposta final fora delas.
+/// AI Studio e força o modelo a separar raciocínio e resposta final pelo delimitador
+/// <c>&lt;FIM_DO_RACIOCINIO&gt;</c> — o C# converte isso nas tags <c>&lt;think&gt;</c> que o painel
+/// isola, mostrando a resposta final fora delas.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -65,13 +65,13 @@ public sealed class GeminiChatService(
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
 
     /// <summary>
-    /// Instrução de sistema (em inglês, mais obedecida pelos modelos) que fixa o contrato de resposta
-    /// estruturada em JSON — sem tags XML, que alguns modelos (ex.: Gemma) acabam tratando como parte
-    /// do próprio raciocínio. O raciocínio vai em <c>thoughts</c>, a resposta final em português vai em
-    /// <c>answer</c>, e o C# converte isso nas tags de pensamento do painel.
+    /// Instrução de sistema que fixa o contrato de resposta baseado no delimitador
+    /// <c>&lt;FIM_DO_RACIOCINIO&gt;</c>: o raciocínio vem em bullet points e a resposta final limpa vem
+    /// logo abaixo da tag. O C# converte isso nas tags de pensamento do painel, sem depender de o
+    /// modelo emitir XML ou JSON.
     /// </summary>
     private const string ChainOfThoughtInstruction =
-        "You are a helpful AI assistant. You MUST respond ONLY with a valid JSON object, never wrapped in markdown code fences. Use exactly this schema: {\"thoughts\": \"your step-by-step internal reasoning here\", \"answer\": \"your final response to the user in Portuguese\"}.";
+        "Você é um assistente prestativo. Faça todo o seu raciocínio natural em bullet points. Ao terminar, escreva OBRIGATORIAMENTE a tag exata <FIM_DO_RACIOCINIO> e, logo abaixo dela, a sua resposta final limpa para o usuário em português, sem bullets e sem aspas.";
 
     private readonly IConfiguration _configuration = configuration;
     private readonly ILogger<GeminiChatService> _logger = logger;
@@ -142,13 +142,12 @@ public sealed class GeminiChatService(
     {
         // Reforço do contrato no fim da fala do operador: alguns modelos (ex.: Gemma) ignoram a
         // system_instruction, então a mesma exigência é colada no próprio prompt — é a última coisa
-        // lida antes da geração, o que aumenta muito a aderência ao JSON.
-        var enhancedPrompt =
-            $"{prompt}\n\n[MANDATORY INSTRUCTION: You MUST respond ONLY with a valid JSON object. Do NOT wrap the JSON in markdown blocks. Use this EXACT format: {{\"thoughts\": \"your step-by-step internal reasoning here\", \"answer\": \"your final response to the user in Portuguese\"}}]";
+        // lida antes da geração, o que aumenta muito a aderência ao delimitador.
+        var enhancedPrompt = $"{prompt}\n\n[MANDATORY INSTRUCTION: 1. Faça todo o seu raciocínio natural em bullet points. 2. Ao terminar, escreva OBRIGATORIAMENTE a tag exata: <FIM_DO_RACIOCINIO> 3. Logo abaixo da tag, escreva a sua resposta final limpa para o usuário.]";
 
         using var request = new HttpRequestMessage(HttpMethod.Post, BuildEndpointUri(modelName))
         {
-            // A instrução de sistema fixa o contrato do JSON de raciocínio e o 'contents' carrega a fala
+            // A instrução de sistema fixa o contrato do delimitador de raciocínio e o 'contents' carrega a fala
             // já reforçada do operador. As propriedades saem nomeadas exatamente como a API espera
             // (system_instruction), sem depender de naming policy.
             Content = JsonContent.Create(new
@@ -172,11 +171,11 @@ public sealed class GeminiChatService(
     }
 
     /// <summary>
-    /// Lê <c>candidates[0].content.parts[0].text</c> e converte a resposta estruturada do modelo
-    /// (<c>{ "thoughts": "...", "answer": "..." }</c>) no contrato de tags do painel:
-    /// <c>&lt;think&gt;{thoughts}&lt;/think&gt;</c> seguido da resposta final. Markdown que o modelo
-    /// insista em usar é removido antes do parse; JSON inválido cai no fallback (texto cru), sem
-    /// derrubar a tentativa. Texto ausente continua sendo falha — a última tentativa escala para o fallback.
+    /// Lê <c>candidates[0].content.parts[0].text</c> e divide a resposta do modelo pelo delimitador
+    /// <c>&lt;FIM_DO_RACIOCINIO&gt;</c>: o que vem antes é o raciocínio (bullet points) e o que vem
+    /// depois é a resposta final já limpa. O resultado sai no contrato de tags do painel
+    /// (<c>&lt;think&gt;{thoughts}&lt;/think&gt;</c> seguido da resposta). Texto ausente continua sendo
+    /// falha — a última tentativa escala para o fallback.
     /// </summary>
     /// <exception cref="InvalidOperationException">Quando o envelope não traz texto útil.</exception>
     private static string ExtractReplyText(string rawResponse)
@@ -191,31 +190,27 @@ public sealed class GeminiChatService(
                 "O Gemini respondeu sem texto em 'candidates[0].content.parts[0].text'.");
         }
 
-        // Limpa possíveis blocos markdown que o modelo insista em colocar.
-        if (rawText.StartsWith("```json", StringComparison.OrdinalIgnoreCase))
+        string thoughts;
+        string answer;
+        var delimiter = "<FIM_DO_RACIOCINIO>";
+
+        if (rawText.Contains(delimiter))
         {
-            rawText = rawText.Substring(7);
+            var parts = rawText.Split(delimiter, StringSplitOptions.None);
+            thoughts = parts[0].Trim();
+
+            // Limpeza agressiva do início/fim da resposta para remover bullets (*, -) e aspas que o Gemma injeta.
+            answer = parts[1].TrimStart('*', '-', ' ').Trim('"', '\'').Trim();
         }
-        else if (rawText.StartsWith("```", StringComparison.Ordinal))
+        else
         {
-            rawText = rawText.Substring(3);
+            thoughts = "O modelo processou a resposta diretamente.";
+            answer = rawText;
         }
 
-        rawText = rawText.TrimEnd('`').Trim();
+        var finalParsedText = $"<think>\n{thoughts}\n</think>\n\n{answer}";
 
-        try
-        {
-            using var doc = JsonDocument.Parse(rawText);
-            var thoughts = doc.RootElement.GetProperty("thoughts").GetString();
-            var answer = doc.RootElement.GetProperty("answer").GetString();
-
-            return $"<think>\n{thoughts}\n</think>\n\n{answer}";
-        }
-        catch
-        {
-            // Fallback caso o modelo não respeite o JSON: devolve o texto cru já sem markdown.
-            return rawText;
-        }
+        return finalParsedText;
     }
 
     /// <summary>
