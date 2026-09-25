@@ -246,7 +246,7 @@ sistema de arquivos local.
 | Operação | Rotas utilizadas |
 | --- | --- |
 | Branch de trabalho | `git/refs` de `GitHub:BaseBranch` → `POST git/refs` (`feat/task-{id}`) |
-| Commit | um blob por arquivo → `git/trees` com `BaseTree` (preserva o conteúdo já versionado) → `git/commits` → `PATCH git/refs` |
+| Commit | `GET git/ref/heads/{branch}` (referência → SHA) → `GET git/commits/{sha}` (commit + árvore base) → um blob por arquivo → `git/trees` com `BaseTree` (preserva o conteúdo já versionado) → `git/commits` → `PATCH git/refs` |
 | Pull request | `POST pulls` (base = `GitHub:BaseBranch`), corpo = descrição sumarizada |
 | Indexação do RAG | `git/trees?recursive=1` + `git/blobs`, filtrando apenas blobs `.cs` com conteúdo textual |
 
@@ -254,6 +254,13 @@ O Octokit 14 não expõe overloads com `CancellationToken` nas rotas de Git; por
 o token antes da árvore e a cada blob baixado. Blobs acima do limite da API voltam sem base64 e são
 ignorados na indexação. O token do agente autônomo (`GitHub:Token`) é obrigatório: o adapter falha
 rápido na construção quando ele não está configurado.
+
+A referência da branch é lida com o prefixo `heads/` (`GET git/ref/heads/feat/task-{id}`) e o commit
+base é buscado pelo **SHA** devolvido por ela: a rota `git/commits/{sha}` não aceita nome de
+referência no path (responderia `404`), e a árvore nova ancora o `BaseTree` no `Tree.Sha` desse commit.
+Como o GitHub replica referências de forma assíncrona, essa leitura repete em até 5 tentativas com 1s
+de intervalo (com `LogWarning` por tentativa) antes de propagar o `404` — a branch recém-criada pode
+ainda não estar visível nos primeiros instantes.
 
 ### Idempotência da entrega
 
@@ -366,6 +373,12 @@ automática da tarefa …` + payload): a entrega já commitada não é desfeita 
   em vez de seguir para um commit vazio.
 - **Commit sem arquivos é erro:** `CommitChangesAsync` recusa um commit vazio de forma explícita (seria
   a branch idêntica à base e o PR vazio).
+- **Commit base resolvido pelo SHA:** `CommitChangesAsync` lê `GET git/ref/heads/{branch}` e só então
+  `GET git/commits/{sha}` — a rota de commit da Git Data API não aceita nome de referência (respondia
+  `404` logo após a criação da branch) — e a árvore nova ancora o `BaseTree` no `Tree.Sha` do commit
+  base; sem árvore devolvida, o método lança `InvalidOperationException` em vez de partir do vazio.
+- **Consistência eventual do GitHub:** a leitura da referência/commit base repete em até 5 tentativas
+  com 1s de intervalo, logando `LogWarning` por tentativa, antes de propagar o `404`.
 - **Trilha do Octokit:** criação de branch, commit (blobs, árvore, referência) e abertura do PR logam
   `LogInformation` com os SHAs/caminhos de cada etapa e `LogError` + rethrow em qualquer falha — o log
   mostra exatamente onde o fluxo parou.

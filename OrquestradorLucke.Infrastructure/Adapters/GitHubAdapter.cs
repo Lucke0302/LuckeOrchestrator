@@ -35,6 +35,16 @@ public sealed class GitHubAdapter : IGitHubService
     /// <summary>Extensão dos arquivos indexados pelo RAG da base de código.</summary>
     private const string CSharpFileExtension = ".cs";
 
+    /// <summary>
+    /// Tentativas de resolução da referência/commit base de uma branch. A API do GitHub replica
+    /// referências de forma assíncrona: logo depois do <c>POST git/refs</c> a leitura pode responder
+    /// <c>404</c> por alguns instantes (consistência eventual) — sem retry o commit morreria aí.
+    /// </summary>
+    private const int BaseReferenceAttempts = 5;
+
+    /// <summary>Intervalo fixo entre as tentativas de resolução da referência/commit base.</summary>
+    private static readonly TimeSpan BaseReferenceRetryDelay = TimeSpan.FromSeconds(1);
+
     private readonly GitHubOptions _options;
     private readonly ILogger<GitHubAdapter> _logger;
 
@@ -161,7 +171,10 @@ public sealed class GitHubAdapter : IGitHubService
     /// <inheritdoc />
     /// <remarks>
     /// A versão 14 do Octokit não expõe overloads com <see cref="CancellationToken"/> nas rotas de
-    /// Git/pull request; por isso o token é validado no início da operação e a cada arquivo.
+    /// Git/pull request; por isso o token é validado no início da operação e a cada arquivo. A leitura
+    /// da referência/commit base é resiliente a <see cref="NotFoundException"/> (consistência eventual
+    /// do GitHub após a criação da branch), e o commit base é buscado pelo SHA — a rota de commit da
+    /// Git Data API não aceita nome de referência no path.
     /// </remarks>
     public async Task<string> CommitChangesAsync(string branchName, string commitMessage, IReadOnlyDictionary<string, string> fileContents, CancellationToken cancellationToken)
     {
@@ -186,10 +199,19 @@ public sealed class GitHubAdapter : IGitHubService
             var repository = _options.Repository;
             var headReference = HeadRefPrefix + branchName;
 
-            // Commit atual: a árvore dele é a base do diff e ele se torna o pai do novo commit.
-            var currentCommit = await Client.Git.Commit
-                .Get(owner, repository, headReference)
-                .ConfigureAwait(false);
+            // Commit base: a árvore dele é a base do diff e ele se torna o pai do novo commit. A
+            // resolução da referência usa o prefixo "heads/" e repete em caso de 404 (consistência
+            // eventual); o commit é lido pelo SHA devolvido por ela, porque a rota de commit da Git
+            // Data API só aceita SHA no path — passar o nome da referência responde 404.
+            var currentCommit = await ResolveHeadCommitAsync(branchName, cancellationToken).ConfigureAwait(false);
+            var baseTreeSha = currentCommit.Tree?.Sha;
+
+            if (string.IsNullOrWhiteSpace(baseTreeSha))
+            {
+                // Sem árvore base o diff partiria do vazio e o conteúdo já versionado seria perdido.
+                throw new InvalidOperationException(
+                    $"O commit {currentCommit.Sha} da branch '{branchName}' não devolveu árvore: sem árvore base não há como montar a nova árvore.");
+            }
 
             var treeItems = new List<NewTreeItem>(fileContents.Count);
 
@@ -215,8 +237,10 @@ public sealed class GitHubAdapter : IGitHubService
             }
 
             // A BaseTree preserva todo o conteúdo já versionado e aplica somente as alterações acima.
-            // No Octokit 14 a coleção NewTree.Tree é somente leitura e já vem inicializada.
-            var newTree = new NewTree { BaseTree = currentCommit.Tree.Sha };
+            // O SHA é o da árvore do commit base resolvido no início (nunca o commit de topo da base,
+            // que pode ter avançado desde a criação da branch). No Octokit 14 a coleção NewTree.Tree é
+            // somente leitura e já vem inicializada.
+            var newTree = new NewTree { BaseTree = baseTreeSha };
 
             foreach (var treeItem in treeItems)
             {
@@ -248,7 +272,7 @@ public sealed class GitHubAdapter : IGitHubService
                 repository,
                 fileContents.Count,
                 createdTree.Sha,
-                currentCommit.Tree.Sha);
+                baseTreeSha);
 
             return newCommit.Sha;
         }
@@ -425,6 +449,62 @@ public sealed class GitHubAdapter : IGitHubService
         }
 
         return files;
+    }
+
+    /// <summary>
+    /// Resolve o commit no topo de uma branch: lê a referência (<c>heads/{branchName}</c>) e busca o
+    /// commit pelo SHA devolvido por ela. A leitura é resiliente a <see cref="NotFoundException"/>
+    /// porque a API do GitHub replica referências de forma assíncrona — imediatamente após a criação
+    /// da branch ela pode responder <c>404</c> por alguns instantes.
+    /// </summary>
+    /// <exception cref="NotFoundException">
+    /// Quando a referência (ou o commit apontado por ela) continua ausente depois de todas as tentativas.
+    /// </exception>
+    private async Task<Octokit.Commit> ResolveHeadCommitAsync(string branchName, CancellationToken cancellationToken)
+    {
+        var reference = HeadRefPrefix + branchName;
+        NotFoundException? lastNotFound = null;
+
+        for (var attempt = 1; attempt <= BaseReferenceAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                var branchReference = await Client.Git.Reference
+                    .Get(_options.Owner, _options.Repository, reference)
+                    .ConfigureAwait(false);
+
+                // A rota de commit da Git Data API exige SHA no path; o SHA da referência aponta para o
+                // commit e a árvore que servem de base (BaseTree e pai) do commit novo.
+                return await Client.Git.Commit
+                    .Get(_options.Owner, _options.Repository, branchReference.Object.Sha)
+                    .ConfigureAwait(false);
+            }
+            catch (NotFoundException ex)
+            {
+                lastNotFound = ex;
+
+                if (attempt == BaseReferenceAttempts)
+                {
+                    break;
+                }
+
+                _logger.LogWarning(
+                    "Referência '{Reference}' de {Owner}/{Repository} indisponível (tentativa {Attempt}/{Attempts}): {Reason} Repetindo em {DelaySeconds}s.",
+                    reference,
+                    _options.Owner,
+                    _options.Repository,
+                    attempt,
+                    BaseReferenceAttempts,
+                    ex.Message,
+                    BaseReferenceRetryDelay.TotalSeconds);
+
+                await Task.Delay(BaseReferenceRetryDelay, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        throw lastNotFound!;
     }
 
     /// <summary>Valida os valores vindos de configuração (IOptions) antes de sair para a rede.</summary>
