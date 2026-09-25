@@ -34,6 +34,7 @@ public sealed class OrchestratorCompositionTests
 
         services.AddOrchestrator(CreateConfiguration());
         services.AddManagementApi(CreateConfiguration());
+        services.AddJwtAuthentication(CreateConfiguration());
 
         // Registrados em Program: o consumidor do canal, o laço do orquestrador e o publicador do log.
         services.AddHostedService<LuckeOrchestratorWorker>();
@@ -138,6 +139,52 @@ public sealed class OrchestratorCompositionTests
         act.Should().Throw<InvalidOperationException>().WithMessage("*ConnectionStrings*");
     }
 
+    [Fact]
+    public void AddJwtAuthentication_SemSegredo_DeveFalharRapido()
+    {
+        // Sem Jwt:Secret (ou com um segredo curto demais) o host subiria assinando/validando token com
+        // chave inválida e só descobriria no primeiro login: a composição recusa antes de subir.
+        var services = CreateHostServices();
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Jwt:Secret"] = "curto-demais",
+                ["Jwt:Issuer"] = "OrquestradorLucke.Tests"
+            })
+            .Build();
+
+        var act = () => services.AddJwtAuthentication(configuration);
+
+        act.Should().Throw<InvalidOperationException>().WithMessage("*Jwt:Secret*");
+    }
+
+    [Fact]
+    public void AddJwtAuthentication_DeveRegistrarOsTemposDeVidaDaAutenticacao()
+    {
+        var services = CreateHostServices();
+
+        services.AddOrchestrator(CreateConfiguration());
+        services.AddJwtAuthentication(CreateConfiguration());
+
+        // O provedor de token é stateless (Singleton); repositório e casos de uso acompanham o escopo da
+        // requisição HTTP, junto do DbContext.
+        services.Should().Contain(descriptor =>
+            descriptor.ServiceType == typeof(IAccessTokenProvider) &&
+            descriptor.Lifetime == ServiceLifetime.Singleton);
+
+        services.Should().Contain(descriptor =>
+            descriptor.ServiceType == typeof(IUserRepository) &&
+            descriptor.Lifetime == ServiceLifetime.Scoped);
+
+        services.Should().Contain(descriptor =>
+            descriptor.ServiceType == typeof(AuthenticationService) &&
+            descriptor.Lifetime == ServiceLifetime.Scoped);
+
+        services.Should().Contain(descriptor =>
+            descriptor.ServiceType == typeof(AuthBootstrapService) &&
+            descriptor.Lifetime == ServiceLifetime.Scoped);
+    }
+
     /// <summary>
     /// Coleção de serviços com os registros que o host faz ANTES de qualquer serviço do usuário:
     /// logging e o lifetime da aplicação. Sem o lifetime, o <c>ValidateOnBuild</c> acusaria o
@@ -154,7 +201,7 @@ public sealed class OrchestratorCompositionTests
         return services;
     }
 
-    /// <summary>Configuração mínima exigida pela composição: a connection string é obrigatória.</summary>
+    /// <summary>Configuração mínima exigida pela composição: a connection string e o segredo do JWT são obrigatórios.</summary>
     private static IConfiguration CreateConfiguration()
         => new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
@@ -164,7 +211,11 @@ public sealed class OrchestratorCompositionTests
                 ["AiStudio:BaseUrl"] = "https://generativelanguage.googleapis.com/",
                 ["AiStudio:ApiVersion"] = "v1beta",
                 ["Frustration:MaxFailures"] = "3",
-                ["Orchestrator:IndexingIntervalMinutes"] = "15"
+                ["Orchestrator:IndexingIntervalMinutes"] = "15",
+                // O HS256 exige 256 bits: o segredo de teste tem os 32+ caracteres mínimos.
+                ["Jwt:Secret"] = "segredo-de-teste-com-tamanho-suficiente-para-hs256",
+                ["Jwt:Issuer"] = "OrquestradorLucke.Tests",
+                ["Jwt:Audience"] = "OrquestradorLucke.Tests.Panel"
             })
             .Build();
 

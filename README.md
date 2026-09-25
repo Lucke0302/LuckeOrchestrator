@@ -26,6 +26,7 @@ trabalho** é o índice vetorial da base de código.
 - [Fila e ciclo de vida da tarefa](#fila-e-ciclo-de-vida-da-tarefa)
 - [Host HTTP e webhook do GitHub](#host-http-e-webhook-do-github)
 - [Backend em tempo real: API de review e SignalR](#backend-em-tempo-real-api-de-review-e-signalr)
+- [Autenticação (JWT + refresh token)](#autenticação-jwt--refresh-token)
 - [Configuração e segredos](#configuração-e-segredos)
 - [Migrations (EF Core + pgvector)](#migrations-ef-core--pgvector)
 - [Resiliência do daemon](#resiliência-do-daemon)
@@ -93,11 +94,11 @@ OrquestradorLucke.Worker          → DI, IOptions e BackgroundService (host do 
 
 | Camada | Responsabilidade | Exemplos |
 | --- | --- | --- |
-| **Domain** | Regras que não dependem de tecnologia | `AgentTask`, `CodeDocument`, `TaskComplexity`, `AgentTaskStatus`, `FrustrationTracker`, `QuotaExhaustedException`, `QuotaState` |
-| **Application** | Contratos e orquestração de caso de uso | `IAgentTaskRepository`, `ILLMProvider`, `IEmbeddingProvider`, `ICodeContextRepository`, `IGitHubService`, `ITaskRouter`, `IQuotaManager`, `CodebaseIndexerService`, `TaskReviewService`, `PullRequestSummary`, `AgentTaskResponse` |
-| **Infrastructure** | Implementações reais | `AppDbContext` (+ migrations), `AgentTaskRepository`, `CodeContextRepository`, `GoogleAiStudioAdapter`, `GitHubAdapter`, `MoETaskRouter`, `DbQuotaManager`, `ModelCatalog`, `AiStudioResponseReader`, `LlmPayloadSanitizer` |
-| **Worker** | Composição e laço do daemon | `Program` (host HTTP: webhook + API + hub), `DependencyInjectionSetup`, `LuckeOrchestratorWorker`, `TaskEndpoints`, `OrchestratorWorkerOptions`, `IndexingChannel`, `IndexingBackgroundService`, `SignalRLogSink`, `SignalRLoggerProvider`, `LogHub`, `LogBroadcastService` |
-| **Tests** | Testes automatizados (xUnit + Moq + FluentAssertions) | `MoETaskRouterTests`, `FrustrationTrackerTests`, `CodebaseIndexerServiceTests`, `OrchestratorCompositionTests`, `GoogleAiStudioAdapterEmbeddingTests`, `GoogleAiStudioAdapterParseTests`, `LuckeOrchestratorWorkerDeliveryTests`, `TaskReviewServiceTests`, `SignalRLogStreamingTests` |
+| **Domain** | Regras que não dependem de tecnologia | `AgentTask`, `CodeDocument`, `User`, `TaskComplexity`, `AgentTaskStatus`, `FrustrationTracker`, `QuotaExhaustedException`, `QuotaState` |
+| **Application** | Contratos e orquestração de caso de uso | `IAgentTaskRepository`, `IUserRepository`, `IAccessTokenProvider`, `ILLMProvider`, `IEmbeddingProvider`, `ICodeContextRepository`, `IGitHubService`, `ITaskRouter`, `IQuotaManager`, `CodebaseIndexerService`, `TaskReviewService`, `AuthenticationService`, `AuthBootstrapService`, `PasswordHasher`, `JwtOptions`, `PullRequestSummary`, `AgentTaskResponse` |
+| **Infrastructure** | Implementações reais | `AppDbContext` (+ migrations), `AgentTaskRepository`, `UserRepository`, `CodeContextRepository`, `JwtTokenProvider`, `GoogleAiStudioAdapter`, `GitHubAdapter`, `MoETaskRouter`, `DbQuotaManager`, `ModelCatalog`, `AiStudioResponseReader`, `LlmPayloadSanitizer` |
+| **Worker** | Composição e laço do daemon | `Program` (host HTTP: webhook + API + hub), `DependencyInjectionSetup`, `LuckeOrchestratorWorker`, `TaskEndpoints`, `AuthEndpoints`, `OrchestratorWorkerOptions`, `IndexingChannel`, `IndexingBackgroundService`, `SignalRLogSink`, `SignalRLoggerProvider`, `LogHub`, `LogBroadcastService` |
+| **Tests** | Testes automatizados (xUnit + Moq + FluentAssertions) | `MoETaskRouterTests`, `FrustrationTrackerTests`, `CodebaseIndexerServiceTests`, `OrchestratorCompositionTests`, `AuthenticationServiceTests`, `AuthBootstrapServiceTests`, `PasswordHasherTests`, `JwtTokenProviderTests`, `GoogleAiStudioAdapterEmbeddingTests`, `GoogleAiStudioAdapterParseTests`, `LuckeOrchestratorWorkerDeliveryTests`, `TaskReviewServiceTests`, `SignalRLogStreamingTests` |
 
 Regras respeitadas no código:
 
@@ -479,7 +480,10 @@ request e o log do daemon chega ao navegador pelo SignalR, sem DBeaver e sem `jo
 
 ### API de gerenciamento (Minimal APIs)
 
-| Rota | Efeito | Token |
+Todas as rotas de `/api/tasks` exigem o **access token** JWT (`.RequireAuthorization()` no grupo); a coluna
+*Credencial no GitHub* diz qual token Octokit a operação usa depois de autenticada.
+
+| Rota | Efeito | Credencial no GitHub |
 | --- | --- | --- |
 | `GET /api/tasks?limit=50` | lista as tarefas, da mais recente para a mais antiga (teto de 200 linhas) | — |
 | `POST /api/tasks` | recebe `{ "payload": "...", "complexidade": "Medio" }`, gera o UUID, insere `Pendente` e responde **200** com a tarefa | — |
@@ -504,6 +508,54 @@ request e o log do daemon chega ao navegador pelo SignalR, sem DBeaver e sem `jo
   tarefa volta para a fila.
 - **Corpo inválido** (`payload` ou `motivo` em branco) ⇒ `400`. O log técnico sai pelo pipeline de
   `ILogger` (console/journald **e** hub), não na resposta HTTP.
+
+### Autenticação (JWT + refresh token)
+
+As rotas administrativas (`/api/tasks`) e o hub de logs exigem um **access token JWT**; a única porta
+anônima do host é `/api/auth`, que troca credenciais por um par de tokens e renova o par sem novo login.
+
+| Rota | Corpo | Efeito |
+| --- | --- | --- |
+| `POST /api/auth/login` | `{ "username": "...", "password": "..." }` | valida a senha (hash SHA256, comparação em tempo constante) e devolve `{ accessToken, refreshToken, accessTokenExpiresAtUtc, refreshTokenExpiresAtUtc }` |
+| `POST /api/auth/refresh` | `{ "refreshToken": "..." }` | confere se o refresh existe e não expirou, **rotaciona** o valor e devolve um par novo |
+
+```powershell
+$base = 'http://localhost:5000'
+
+# 1) Login: credenciais ⇒ par de tokens
+$tokens = Invoke-RestMethod -Method Post "$base/api/auth/login" -ContentType 'application/json' `
+    -Body '{"username":"admin","password":"<senha>"}'
+
+# 2) Rota protegida: o access token vai no cabeçalho Authorization
+Invoke-RestMethod "$base/api/tasks" -Headers @{ Authorization = "Bearer $($tokens.accessToken)" }
+
+# 3) Renovação: o refresh devolve um par novo (o token usado deixa de valer)
+$tokens = Invoke-RestMethod -Method Post "$base/api/auth/refresh" -ContentType 'application/json' `
+    -Body (@{ refreshToken = $tokens.refreshToken } | ConvertTo-Json)
+```
+
+- **Access token de 15 minutos** (`Jwt:AccessTokenMinutes`), assinado em HS256 com `Jwt:Secret` e claims
+  registradas `sub` (Id da conta) e `unique_name` (login). `ClockSkew = Zero`: os 5 minutos de tolerância
+  padrão estenderiam um token curto para 20 — quem precisa de mais tempo renova pelo `/api/auth/refresh`.
+- **Refresh token de 7 dias** (`Jwt:RefreshTokenDays`): 64 bytes de aleatoriedade criptográfica em
+  Base64Url gravados em `users.refresh_token`. É **rotativo** — cada refresh substitui o valor, então uma
+  cópia vazada vale no máximo até o próximo uso legítimo, e reusar o token antigo responde `401`.
+- **A senha nunca é persistida nem comparada em claro:** o login recalcula o SHA256 e compara com
+  `users.password_hash` via `CryptographicOperations.FixedTimeEquals` (tempo constante). Usuário
+  inexistente e senha errada devolvem o **mesmo** `401` — a resposta não confirma se o login existe.
+- **Fail fast do segredo:** sem `Jwt:Secret` (ou com menos de 32 caracteres, o mínimo do HMAC-SHA256) o
+  host **não sobe** — `AddJwtAuthentication` valida a configuração na composição, como faz com a
+  connection string. O segredo nunca está no código.
+- **Pipeline:** `app.UseAuthentication()` + `app.UseAuthorization()` rodam **antes** dos endpoints; o
+  grupo `/api/tasks` usa `.RequireAuthorization()`, o `LogHub` tem `[Authorize]` e o webhook do GitHub
+  segue anônimo (ele se autentica pelo HMAC da assinatura, não por JWT).
+- **Hub autenticado sem cabeçalho:** o WebSocket do SignalR não envia `Authorization`, então o access
+  token vai na query string (`?access_token=...`) e é extraído no `OnMessageReceived` do `JwtBearer` —
+  somente na rota do hub, para que um `access_token` esquecido em uma chamada de API não autentique.
+- **Usuário inicial (`Auth:Username`/`Auth:Password`):** não existe rota de registro; o start do host
+  semeia a primeira conta quando a tabela `users` está vazia, lendo a senha de user-secrets/variável de
+  ambiente e gravando apenas o hash SHA256. Com contas já cadastradas o seed não faz nada — um restart
+  jamais reaplica a senha da configuração.
 
 ### Streaming de logs (SignalR)
 
@@ -533,10 +585,18 @@ LogHub — rota /hubs/logs —► "log" (um evento) / "history" (retrovisor ao c
 - **`LogStreaming`:** `Enabled`, `MinimumLevel` (independe do filtro do journald), `QueueCapacity` (o
   evento mais antigo é descartado quando a fila enche), `HistorySize` (retrovisor; `0` desliga) e
   `MaxMessageLength` (mensagem truncada com `...`).
+- **Hub fechado para anônimos:** `LogHub` é `[Authorize]` (o log expõe payload de tarefa e caminho de
+  arquivo) e o cliente conecta com o access token — ver
+  [Autenticação (JWT + refresh token)](#autenticação-jwt--refresh-token). Sem token, o `negotiate`
+  responde `401`.
 
 ```javascript
 const connection = new signalR.HubConnectionBuilder()
-    .withUrl('http://localhost:5080/hubs/logs')  // origem precisa estar em Cors:AllowedOrigins
+    .withUrl('http://localhost:5080/hubs/logs', {  // origem precisa estar em Cors:AllowedOrigins
+        // O hub é [Authorize]: o WebSocket não envia cabeçalho, então o token vai na query string
+        // (?access_token=...) — é o OnMessageReceived do JwtBearer que o lê, só nesta rota.
+        accessTokenFactory: () => accessToken
+    })
     .withAutomaticReconnect()
     .build();
 
@@ -586,6 +646,10 @@ ela. Lista vazia ⇒ nenhuma origem cruzada liberada (e nada quebra no start).
 | `GitHub:MergeMethod` | estratégia de merge da aprovação (`Merge`, `Squash` ou `Rebase`) |
 | `GitHub:Owner` / `Repository` / `BaseBranch` | repositório de trabalho e branch base |
 | `GitHub:WebhookSecret` | **segredo** do HMAC-SHA256 do webhook (variável de ambiente / user-secrets) |
+| `Jwt:Secret` | **segredo** da assinatura HS256 dos access tokens (≥ 32 caracteres; falta dele ⇒ o host não sobe) |
+| `Jwt:Issuer` / `Jwt:Audience` | emissor/público gravados no token e exigidos na validação |
+| `Jwt:AccessTokenMinutes` / `Jwt:RefreshTokenDays` | validade do access token (15 min) e do refresh token (7 dias) |
+| `Auth:Username` / `Auth:Password` | credenciais do usuário inicial do seed (senha vira hash SHA256; sem elas o seed não roda) |
 | `Frustration:MaxFailures` | falhas toleradas antes do overdrive (alimenta o histórico entregue ao overdrive) |
 | `Orchestrator:PollingIntervalSeconds` | cadência do laço quando a fila está vazia |
 | `Orchestrator:QuotaCooldownMinutes` | cooldown do laço quando toda a cadeia MoE está bloqueada |
@@ -596,9 +660,10 @@ ela. Lista vazia ⇒ nenhuma origem cruzada liberada (e nada quebra no start).
 
 > **Atenção (systemd/Production):** user-secrets e `appsettings.Development.json` **não** são
 > carregados fora do ambiente Development. Em produção, `AiStudio:ApiKey`, `GitHub:AgentToken`,
-> `GitHub:AdminToken`, `GitHub:WebhookSecret`, `GitHub:Owner` e `GitHub:Repository` precisam vir de
-> variáveis de ambiente do unit (`AiStudio__ApiKey`, `GitHub__AgentToken`, `GitHub__AdminToken`,
-> `GitHub__WebhookSecret`, `GitHub__Owner`, `GitHub__Repository`), por exemplo via
+> `GitHub:AdminToken`, `GitHub:WebhookSecret`, `GitHub:Owner`, `GitHub:Repository`, `Jwt:Secret` e
+> `Auth:Password` precisam vir de variáveis de ambiente do unit (`AiStudio__ApiKey`,
+> `GitHub__AgentToken`, `GitHub__AdminToken`, `GitHub__WebhookSecret`, `GitHub__Owner`,
+> `GitHub__Repository`, `Jwt__Secret`, `Auth__Username`, `Auth__Password`), por exemplo via
 > `EnvironmentFile=/etc/lucke/lucke.env`.
 
 ## Migrations (EF Core + pgvector)
@@ -617,6 +682,9 @@ dotnet ef migrations add AddHnswIndex --project OrquestradorLucke.Infrastructure
 
 # Cria a migration do Circuit Breaker de cota persistido
 dotnet ef migrations add AddQuotaState --project OrquestradorLucke.Infrastructure --output-dir Data/Migrations
+
+# Cria a migration das contas autenticáveis (login/refresh token)
+dotnet ef migrations add AddUsersTable --project OrquestradorLucke.Infrastructure --output-dir Data/Migrations
 
 # Aplica no banco (idempotente por histórico de migrations)
 dotnet ef database update --project OrquestradorLucke.Infrastructure
@@ -659,11 +727,32 @@ Migrations existentes:
   depois de um reinício do daemon e é compartilhado por todas as instâncias que apontam para o mesmo
   PostgreSQL. A `Down` derruba a tabela (o Circuit Breaker volta a se comportar como se nenhum modelo
   estivesse bloqueado).
+- `AddUsersTable` — tabela `users` (contas do login/refresh token):
+
+  ```sql
+  CREATE TABLE users (
+      id uuid NOT NULL CONSTRAINT pk_users PRIMARY KEY,
+      username character varying(64) NOT NULL,
+      password_hash character varying(64) NOT NULL,
+      refresh_token character varying(128) NULL,
+      refresh_token_expiry timestamp with time zone NULL,
+      created_at timestamp with time zone NOT NULL
+  );
+  CREATE UNIQUE INDEX ux_users_username ON users (username);
+  CREATE UNIQUE INDEX ux_users_refresh_token ON users (refresh_token);
+  ```
+
+  `username` guarda a forma canônica do login (sem espaços nas pontas, minúsculo) — por isso o índice
+  único também garante unicidade sem diferenciar maiúsculas. `password_hash` tem 64 caracteres fixos
+  (SHA256 em hexadecimal) e `refresh_token` é único e nulo para quem nunca autenticou (o Npgsql não
+  indexa nulos, então as contas "sem token" convivem no mesmo índice). A `Down` derruba a tabela — e,
+  com ela, as contas.
 
 > **Aplique `database update` antes de rodar o daemon.** Sem a tabela `code_documents`, a indexação e
 > o RAG falham de forma degradada (a tarefa segue sem contexto, com log de aviso) — a fila continua
 > funcionando. Sem `quota_states`, o Circuit Breaker de cota falha na primeira consulta e a tarefa é
-> encerrada como `Falhou` naquele ciclo; aplique a migration junto com o deploy.
+> encerrada como `Falhou` naquele ciclo; sem `users`, **todo** login responde erro e o seed do usuário
+> inicial falha (o host sobe, mas a API segue inacessível) — aplique as migrations junto com o deploy.
 
 ## Resiliência do daemon
 
@@ -696,6 +785,9 @@ dotnet user-secrets set "AiStudio:ApiKey"       "<chave>"   --project Orquestrad
 dotnet user-secrets set "GitHub:AgentToken"     "<token do agente>"  --project OrquestradorLucke.Worker
 dotnet user-secrets set "GitHub:AdminToken"     "<token do revisor>" --project OrquestradorLucke.Worker
 dotnet user-secrets set "GitHub:WebhookSecret"  "<segredo>" --project OrquestradorLucke.Worker
+dotnet user-secrets set "Jwt:Secret"            "<segredo de 32+ caracteres>" --project OrquestradorLucke.Worker
+dotnet user-secrets set "Auth:Username"         "admin" --project OrquestradorLucke.Worker
+dotnet user-secrets set "Auth:Password"         "<senha do usuário inicial>" --project OrquestradorLucke.Worker
 
 # 2) Banco: aplica as migrations (assume o DEFAULT_CONNECTION já configurado)
 $env:ConnectionStrings__DefaultConnection='Host=<host>;Database=lucke_db;Username=<user>;Password=<senha>'
@@ -716,19 +808,27 @@ $signature = 'sha256=' + [Convert]::ToHexString($mac.ComputeHash([Text.Encoding]
 Invoke-WebRequest -Method Post http://localhost:5000/api/webhook/github `
     -Body $body -ContentType 'application/json' -Headers @{ 'X-Hub-Signature-256' = $signature }
 
-# 6) API de gerenciamento/revisão (o mesmo host que atende o webhook)
-$base = 'http://localhost:5000'
-Invoke-RestMethod -Method Post "$base/api/tasks" -ContentType 'application/json' `
+# 6) API de gerenciamento/revisão (o mesmo host que atende o webhook) — agora exige o access token
+$base   = 'http://localhost:5000'
+$tokens = Invoke-RestMethod -Method Post "$base/api/auth/login" -ContentType 'application/json' `
+    -Body '{"username":"admin","password":"<senha>"}'
+$auth   = @{ Authorization = "Bearer $($tokens.accessToken)" }   # o seed criou a conta no start
+
+Invoke-RestMethod -Method Post "$base/api/tasks" -Headers $auth -ContentType 'application/json' `
     -Body '{"payload":"Criar endpoint de cálculo de frete","complexidade":"Medio"}'
-Invoke-RestMethod -Method Get  "$base/api/tasks?limit=20"
+Invoke-RestMethod -Method Get  "$base/api/tasks?limit=20" -Headers $auth
 
 $taskId = '<id devolvido pelo POST>'
-Invoke-RestMethod -Method Post "$base/api/tasks/$taskId/accept"      # merge do PR (AdminToken) ⇒ Aprovada
-Invoke-RestMethod -Method Post "$base/api/tasks/$taskId/reject" -ContentType 'application/json' `
-    -Body '{"motivo":"Faltou validação de entrada"}'                # fecha o PR + volta para Pendente
+Invoke-RestMethod -Method Post "$base/api/tasks/$taskId/accept" -Headers $auth   # merge do PR (AdminToken) ⇒ Aprovada
+Invoke-RestMethod -Method Post "$base/api/tasks/$taskId/reject" -Headers $auth -ContentType 'application/json' `
+    -Body '{"motivo":"Faltou validação de entrada"}'                             # fecha o PR + volta para Pendente
 
-# 7) Log em tempo real: o painel web conecta no hub (SignalR) e recebe os eventos "history"/"log"
-#    ws://localhost:5000/hubs/logs  (o negotiate sai em POST /hubs/logs/negotiate?negotiateVersion=1)
+# Quando o access token expira (15 min), o refresh devolve um par novo
+$tokens = Invoke-RestMethod -Method Post "$base/api/auth/refresh" -ContentType 'application/json' `
+    -Body (@{ refreshToken = $tokens.refreshToken } | ConvertTo-Json)
+
+# 7) Log em tempo real: o painel conecta no hub (SignalR) com o access token e recebe "history"/"log"
+#    ws://localhost:5000/hubs/logs?access_token=... (negotiate: POST /hubs/logs/negotiate?negotiateVersion=1)
 ```
 
 Para rodar a suíte de testes: `dotnet test` (ou por projeto, como em
@@ -775,8 +875,10 @@ Os demais testes cobrem as melhorias arquiteturais:
 - `OrchestratorCompositionTests` — executa a mesma validação de DI que o host faz no start
   (`ValidateOnBuild`/`ValidateScopes`) sobre a composição real, além de fixar os tempos de vida de
   `DbQuotaManager` (Scoped), `IndexingChannel` (Singleton), `FrustrationTracker` (Singleton, o **mesmo**
-  em qualquer escopo — é o que liga a rejeição da API ao overdrive do laço) e `TaskReviewService`
-  (Scoped), o registro do provider de log do hub e o fail fast da connection string;
+  em qualquer escopo — é o que liga a rejeição da API ao overdrive do laço), `TaskReviewService`
+  (Scoped), de `IAccessTokenProvider` (Singleton), `IUserRepository`/`AuthenticationService`/
+  `AuthBootstrapService` (Scoped), o registro do provider de log do hub e o fail fast da connection
+  string e do `Jwt:Secret`;
 - `GoogleAiStudioAdapterParseTests` — o JSON cercado por crases/alvo de markdown é sanitizado antes da
   desserialização (cercas em linha própria, coladas no objeto, rótulo `json` solto e cerca com prosa),
   crases legítimas dentro de um valor de string não são mutadas, o retorno sem arquivo utilizável falha
@@ -793,6 +895,18 @@ Os demais testes cobrem as melhorias arquiteturais:
   `MinimumLevel`, trunca a mensagem no teto, mantém o retrovisor circular com os eventos mais recentes,
   respeita `Enabled` e descarta o log emitido durante a publicação (a trava contra realimentação do
   canal).
+- `AuthenticationServiceTests` — login com credenciais válidas emite o par e persiste **o mesmo** refresh
+  devolvido (janela de 7 dias, valor trocado em relação ao anterior); o nome de login é normalizado antes
+  da consulta; senha errada e conta inexistente recusam sem escrever nada; refresh vigente rotaciona o
+  token, expirado/desconhecido recusam e campo vazio nem chega ao repositório;
+- `PasswordHasherTests` — o hash é SHA256 hexadecimal determinístico (64 caracteres), senhas diferentes
+  geram hashes diferentes, a verificação aprova só a senha certa e um hash corrompido recusa sem exceção;
+- `AuthBootstrapServiceTests` — sem credenciais configuradas nada é criado (nem consulta o banco), com a
+  tabela vazia a conta nasce com o login normalizado e **só** o hash SHA256, e com contas existentes o
+  seed não sobrescreve a senha;
+- `JwtTokenProviderTests` — o token emitido valida com os **mesmos** parâmetros do `JwtBearer` do host
+  (emissor, público, chave e lifetime), carrega `sub`/`unique_name` da conta, dura 15 minutos, é
+  rejeitado por outro segredo e sem `Jwt:Secret` a emissão falha rápido.
 
 ## Limitações e próximos passos
 
@@ -808,10 +922,15 @@ Os demais testes cobrem as melhorias arquiteturais:
 - **Histórico de falhas global:** a memória da frustração é do daemon (não por tarefa) — o overdrive
   recebe os motivos mais recentes, que podem incluir tarefas anteriores; um `FrustrationTracker` por
   tarefa, com múltiplas retentativas, é a evolução natural.
-- **API sem autenticação:** as rotas de gerenciamento/review e o hub não exigem credencial — elas
-  assumem o perímetro do daemon (bind em `127.0.0.1` ou atrás de um proxy com autenticação). O
-  `AdminToken` é exercido pelo processo, não pelo revisor que usa o painel: expor a API publicamente
-  exige autenticação/HTTPS antes.
+- **API sem HTTPS próprio:** as rotas de gerenciamento/review e o hub agora exigem JWT (login/refresh em
+  `/api/auth`), mas o host não termina TLS — sobre HTTP puro o segredo e as credenciais trafegam em claro,
+  então expor a API publicamente continua exigindo um proxy com HTTPS. Também não há papéis (todo usuário
+  é administrador), bloqueio por tentativas repetidas (o login recusado só gera `LogWarning`) nem
+  revogação de refresh token pelo servidor. O `AdminToken` segue sendo exercido pelo processo, não pelo
+  revisor: a revisão no GitHub usa a identidade do bot.
+- **Hash de senha é SHA256 simples:** sem salt nem alongamento de chave (o formato pedido é o hash
+  simples, e é o que `PasswordHasher` concentra). Migrar para PBKDF2/bcrypt/Argon2 é uma troca localizada
+  nessa classe, com uma migration de dados para reescrever as contas existentes.
 - **Motivo da rejeição não persistido:** o `motivo` fecha o PR (comentário) e entra no histórico de
   frustração, mas não há coluna em `agent_tasks` para ele — um `review_note` com migration permitiria
   listar as rejeições no painel sem abrir o PR.

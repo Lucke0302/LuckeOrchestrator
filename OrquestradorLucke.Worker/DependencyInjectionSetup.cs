@@ -1,6 +1,10 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.JsonWebTokens;
+using Microsoft.IdentityModel.Tokens;
 using OrquestradorLucke.Application.Configuration;
 using OrquestradorLucke.Application.Interfaces;
 using OrquestradorLucke.Application.Services;
@@ -10,6 +14,7 @@ using OrquestradorLucke.Infrastructure.Configuration;
 using OrquestradorLucke.Infrastructure.Data;
 using OrquestradorLucke.Infrastructure.Data.Repositories;
 using OrquestradorLucke.Infrastructure.Quota;
+using OrquestradorLucke.Infrastructure.Security;
 using OrquestradorLucke.Worker.Configuration;
 using OrquestradorLucke.Worker.Logging;
 using Polly;
@@ -19,11 +24,19 @@ namespace OrquestradorLucke.Worker;
 /// <summary>
 /// Composição da injeção de dependência do host: bind dos IOptions, persistência PostgreSQL
 /// (EF Core + Npgsql + pgvector), um expert do Google AI Studio por modelo do catálogo MoE,
-/// Circuit Breaker de cota, política de resiliência (Polly), o medidor de frustração compartilhado e a
-/// API de gerenciamento/revisão com o streaming de logs pelo SignalR.
+/// Circuit Breaker de cota, política de resiliência (Polly), o medidor de frustração compartilhado, a
+/// autenticação JWT das rotas administrativas e a API de gerenciamento/revisão com o streaming de logs
+/// pelo SignalR.
 /// </summary>
 public static class DependencyInjectionSetup
 {
+    /// <summary>
+    /// Nome do parâmetro de query que carrega o access token nas conexões do hub de logs: o WebSocket
+    /// do SignalR não envia o cabeçalho <c>Authorization</c>, então o token (15 minutos) vai na query
+    /// string e é extraído no evento <c>OnMessageReceived</c> do <c>JwtBearer</c>.
+    /// </summary>
+    public const string AccessTokenQueryParameterName = "access_token";
+
     /// <summary>Registra as opções, os serviços de infraestrutura e o roteador MoE.</summary>
     /// <param name="services">Coleção de serviços do host.</param>
     /// <param name="configuration">Configuração da aplicação (appsettings/user-secrets/variáveis de ambiente).</param>
@@ -144,6 +157,118 @@ public static class DependencyInjectionSetup
         }));
 
         return services;
+    }
+
+    /// <summary>
+    /// Registra a autenticação JWT (access token de 15 minutos, refresh de 7 dias) e a autorização das
+    /// rotas administrativas: o token é validado com o segredo de <c>Jwt:Secret</c> e, no hub do
+    /// SignalR, também aceito pela query string <c>access_token</c> — o WebSocket não envia cabeçalhos.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Depende da persistência registrada em <see cref="AddOrchestrator"/> (o repositório de contas) e é
+    /// composta antes de <c>UseAuthentication</c>/<c>UseAuthorization</c> no pipeline. A configuração é
+    /// validada na composição: sem segredo utilizável o host falha no start, e não no primeiro login.
+    /// </para>
+    /// <para>
+    /// A mesma instância de <see cref="JwtOptions"/> é oferecida de duas formas: <c>IOptions&lt;T&gt;</c>
+    /// para a Infrastructure (padrão do projeto) e como objeto direto para a Application, que não
+    /// referencia o pacote de Options — assim há uma única fonte de verdade para o segredo e as duas
+    /// validades.
+    /// </para>
+    /// </remarks>
+    /// <param name="services">Coleção de serviços do host.</param>
+    /// <param name="configuration">Configuração da aplicação (appsettings/user-secrets/variáveis de ambiente).</param>
+    public static IServiceCollection AddJwtAuthentication(this IServiceCollection services, IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        var jwt = ReadJwtOptions(configuration);
+
+        services.Configure<JwtOptions>(configuration.GetSection(JwtOptions.SectionName));
+        services.AddSingleton(jwt);
+
+        // Credenciais do usuário inicial (seed do primeiro start): a instância direta segue o mesmo
+        // motivo do JwtOptions — a Application não conhece o pacote de Options.
+        services.AddSingleton(ReadBootstrapSettings(configuration));
+
+        // Autenticação: o provedor de token é stateless (Singleton); o repositório de contas e os casos
+        // de uso são Scoped, junto do DbContext do escopo da requisição HTTP.
+        services.AddSingleton<IAccessTokenProvider, JwtTokenProvider>();
+        services.AddScoped<IUserRepository, UserRepository>();
+        services.AddScoped<AuthenticationService>();
+        services.AddScoped<AuthBootstrapService>();
+
+        services
+            .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+            .AddJwtBearer(options =>
+            {
+                options.TokenValidationParameters = new TokenValidationParameters
+                {
+                    ValidateIssuer = true,
+                    ValidIssuer = jwt.Issuer,
+                    ValidateAudience = true,
+                    ValidAudience = jwt.Audience,
+                    ValidateIssuerSigningKey = true,
+                    IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwt.Secret)),
+                    ValidateLifetime = true,
+                    // Sem tolerância: os 5 minutos de skew padrão estenderiam um token de 15 minutos para
+                    // 20 — o cliente renova pelo /api/auth/refresh, então não há folga a dar.
+                    ClockSkew = TimeSpan.Zero,
+                    NameClaimType = JwtRegisteredClaimNames.UniqueName
+                };
+
+                options.Events = new JwtBearerEvents
+                {
+                    OnMessageReceived = context =>
+                    {
+                        // O WebSocket do SignalR não carrega o cabeçalho Authorization: o token chega na
+                        // query string (?access_token=...). A leitura é restrita à rota do hub para que um
+                        // access_token perdido em uma chamada de API não autentique por acidente.
+                        var accessToken = context.Request.Query[AccessTokenQueryParameterName];
+
+                        if (!string.IsNullOrEmpty(accessToken)
+                            && context.HttpContext.Request.Path.StartsWithSegments(LogStreamContract.HubRoute))
+                        {
+                            context.Token = accessToken;
+                        }
+
+                        return Task.CompletedTask;
+                    }
+                };
+            });
+
+        services.AddAuthorization();
+
+        return services;
+    }
+
+    /// <summary>
+    /// Lê e valida as opções de JWT na composição — o segredo e as validades são exigidos antes de o
+    /// host subir, não na primeira autenticação.
+    /// </summary>
+    private static JwtOptions ReadJwtOptions(IConfiguration configuration)
+    {
+        var section = configuration.GetSection(JwtOptions.SectionName);
+        var jwt = section.Exists() ? section.Get<JwtOptions>() ?? new JwtOptions() : new JwtOptions();
+
+        jwt.EnsureUsable();
+
+        return jwt;
+    }
+
+    /// <summary>
+    /// Lê as credenciais do usuário inicial (seção <c>Auth</c>). Uma seção ausente ou vazia é válida: o
+    /// seed simplesmente não cria conta nenhuma.
+    /// </summary>
+    private static AuthBootstrapSettings ReadBootstrapSettings(IConfiguration configuration)
+    {
+        var section = configuration.GetSection(AuthBootstrapSettings.SectionName);
+
+        return section.Exists()
+            ? section.Get<AuthBootstrapSettings>() ?? new AuthBootstrapSettings()
+            : new AuthBootstrapSettings();
     }
 
     /// <summary>

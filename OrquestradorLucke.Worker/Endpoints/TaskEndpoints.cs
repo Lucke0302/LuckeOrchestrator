@@ -31,12 +31,17 @@ public static class TaskEndpoints
     public const string RoutePrefix = "/api/tasks";
 
     /// <summary>Registra as rotas de tarefas no host.</summary>
+    /// <remarks>
+    /// Todas as rotas do grupo exigem um access token válido (<c>RequireAuthorization</c>): a gestão da
+    /// fila e a revisão do pull request são operações administrativas, e quem as assina é a conta do
+    /// painel autenticada por JWT — a única porta sem autenticação é o <c>/api/auth</c>.
+    /// </remarks>
     /// <param name="endpoints">Construtor de rotas do host.</param>
     public static IEndpointRouteBuilder MapTaskEndpoints(this IEndpointRouteBuilder endpoints)
     {
         ArgumentNullException.ThrowIfNull(endpoints);
 
-        var group = endpoints.MapGroup(RoutePrefix);
+        var group = endpoints.MapGroup(RoutePrefix).RequireAuthorization();
 
         group.MapGet("/", GetTasksAsync);
         group.MapPost("/", CreateTaskAsync);

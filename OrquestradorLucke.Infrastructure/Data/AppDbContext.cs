@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using OrquestradorLucke.Application.Services;
 using OrquestradorLucke.Domain;
 using OrquestradorLucke.Infrastructure.Configuration;
 using Pgvector;
@@ -24,6 +25,9 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     /// <summary>Circuit Breaker de cota persistido (tabela <c>quota_states</c>).</summary>
     public DbSet<QuotaState> QuotaStates => Set<QuotaState>();
 
+    /// <summary>Contas autenticáveis da plataforma web (tabela <c>users</c>).</summary>
+    public DbSet<User> Users => Set<User>();
+
     /// <summary>Configura a extensão vetorial e o mapeamento explícito das entidades.</summary>
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -36,6 +40,7 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
         ConfigureAgentTask(modelBuilder);
         ConfigureCodeDocument(modelBuilder);
         ConfigureQuotaState(modelBuilder);
+        ConfigureUser(modelBuilder);
     }
 
     /// <summary>
@@ -181,6 +186,61 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
             entity.HasIndex(state => state.ProviderName)
                 .IsUnique()
                 .HasDatabaseName("ux_quota_states_provider_name");
+        });
+    }
+
+    /// <summary>
+    /// Mapeamento explícito de <see cref="User"/> (contas autenticáveis da plataforma web).
+    /// </summary>
+    /// <remarks>
+    /// Os dois índices únicos são o que torna as buscas do login e do refresh previsíveis:
+    /// <c>ux_users_username</c> garante uma conta por nome de login (já normalizado pelo domínio, logo
+    /// sem diferenciar maiúsculas) e <c>ux_users_refresh_token</c> impede que dois usuários carreguem o
+    /// mesmo refresh token — o Npgsql não indexa valores nulos, então as contas que nunca autenticaram
+    /// convivem com <c>refresh_token</c> nulo.
+    /// </remarks>
+    private static void ConfigureUser(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<User>(entity =>
+        {
+            entity.ToTable("users");
+            entity.HasKey(user => user.Id).HasName("pk_users");
+
+            // O identificador é gerado pelo domínio (Guid.NewGuid()), não pelo banco.
+            entity.Property(user => user.Id)
+                .HasColumnName("id")
+                .ValueGeneratedNever();
+
+            entity.Property(user => user.Username)
+                .HasColumnName("username")
+                .HasMaxLength(64)
+                .IsRequired();
+
+            // SHA256 em hexadecimal: sempre 64 caracteres, nunca a senha em claro.
+            entity.Property(user => user.PasswordHash)
+                .HasColumnName("password_hash")
+                .HasMaxLength(PasswordHasher.HashLength)
+                .IsRequired();
+
+            // Base64Url de 64 bytes aleatórios (86 caracteres) + folga para uma eventual troca de formato.
+            entity.Property(user => user.RefreshToken)
+                .HasColumnName("refresh_token")
+                .HasMaxLength(128);
+
+            entity.Property(user => user.RefreshTokenExpiry)
+                .HasColumnName("refresh_token_expiry");
+
+            entity.Property(user => user.CreatedAt)
+                .HasColumnName("created_at")
+                .IsRequired();
+
+            entity.HasIndex(user => user.Username)
+                .IsUnique()
+                .HasDatabaseName("ux_users_username");
+
+            entity.HasIndex(user => user.RefreshToken)
+                .IsUnique()
+                .HasDatabaseName("ux_users_refresh_token");
         });
     }
 }

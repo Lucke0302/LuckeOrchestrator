@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using OrquestradorLucke.Application.Services;
 using OrquestradorLucke.Worker;
 using OrquestradorLucke.Worker.Configuration;
 using OrquestradorLucke.Worker.Endpoints;
@@ -32,6 +33,11 @@ builder.Services.AddOrchestrator(builder.Configuration);
 // API de gerenciamento/revisão (Minimal APIs), streaming de logs (SignalR) e CORS do painel web.
 builder.Services.AddManagementApi(builder.Configuration);
 
+// Autenticação JWT das rotas administrativas e do hub de logs (access token de 15 minutos, refresh de
+// 7 dias). Composta depois da API porque usa a persistência e o repositório de contas do orquestrador;
+// o segredo (Jwt:Secret) é validado aqui — sem ele o host não sobe com a API aberta.
+builder.Services.AddJwtAuthentication(builder.Configuration);
+
 // Laço do orquestrador (fila → expert → branch/commit/PR), consumidor do gatilho de indexação (uma
 // indexação por vez) e publicador do log no hub (consumidor do canal do streaming).
 builder.Services.AddHostedService<LuckeOrchestratorWorker>();
@@ -47,6 +53,13 @@ var app = builder.Build();
 // CORS antes dos endpoints: o painel web (outra origem) alcança a API e o negotiate do hub. As
 // origens vêm de Cors:AllowedOrigins — sem origem liberada, o navegador simplesmente é bloqueado.
 app.UseCors(CorsSettings.PolicyName);
+
+// Autenticação e autorização ANTES dos endpoints: /api/tasks e o hub de logs exigem um access token
+// válido (o hub recebe o token pela query string 'access_token', tratada em AddJwtAuthentication,
+// porque o WebSocket não envia cabeçalho). Login/refresh e o webhook do GitHub seguem anônimos — o
+// webhook se autentica pelo HMAC da assinatura, não por JWT.
+app.UseAuthentication();
+app.UseAuthorization();
 
 // Webhook do GitHub: substitui o polling do indexador (Orchestrator:IndexingIntervalMinutes) por um
 // gancho pós-merge. Valida o HMAC-SHA256 do corpo bruto (X-Hub-Signature-256) contra o segredo
@@ -93,6 +106,10 @@ app.MapPost("/api/webhook/github", async (
     return Results.Accepted();
 });
 
+// Autenticação (única porta anônima do host): troca credenciais por um par de tokens e renova o par
+// sem novo login. As rotas /api/tasks exigem o access token emitido aqui.
+app.MapAuthEndpoints();
+
 // API de gerenciamento/revisão do painel web: listar, enfileirar, aprovar (merge com o AdminToken) e
 // rejeitar (fecha o PR, alimenta o medidor de frustração e devolve a tarefa para Pendente).
 app.MapTaskEndpoints();
@@ -100,6 +117,11 @@ app.MapTaskEndpoints();
 // Streaming de logs: o hub entrega ao painel o log da aplicação em tempo real (o provider capturado
 // em AddManagementApi alimenta o canal que o LogBroadcastService publica aqui).
 app.MapHub<LogHub>(LogStreamContract.HubRoute);
+
+// Usuário inicial: o login valida contra a tabela 'users' e não há rota de registro — uma tabela vazia
+// deixaria a API inalcançável. O seed (Auth:Username/Auth:Password, via user-secrets) só escreve
+// quando não existe conta alguma, e o que chega ao banco é o hash SHA256, nunca a senha em claro.
+await BootstrapAuthUserAsync(app.Services, app.Logger);
 
 app.Run();
 
@@ -139,6 +161,41 @@ static bool IsSignatureValid(string secret, byte[] body, string signatureHeader)
     using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
 
     return CryptographicOperations.FixedTimeEquals(hmac.ComputeHash(body), providedSignature);
+}
+
+/// <summary>
+/// Cria a conta inicial a partir de <c>Auth:Username</c>/<c>Auth:Password</c> quando a tabela
+/// <c>users</c> ainda está vazia — sem conta, o login (e portanto a API protegida) seria inalcançável.
+/// </summary>
+/// <remarks>
+/// O escopo é criado e descartado aqui porque o <see cref="AuthBootstrapService"/> é Scoped (carrega o
+/// <c>DbContext</c>) e não pode ser resolvido da raiz do container — a mesma regra do laço do daemon.
+/// Uma falha (banco fora do ar no start, por exemplo) é registrada e <b>não</b> derruba o host: o
+/// orquestrador tem a própria política de reconexão e o seed roda de novo no próximo start.
+/// </remarks>
+/// <param name="services">Provedor raiz do host.</param>
+/// <param name="logger">Logger do host para registrar o desfecho do seed.</param>
+static async Task BootstrapAuthUserAsync(IServiceProvider services, ILogger logger)
+{
+    await using var scope = services.CreateAsyncScope();
+
+    try
+    {
+        var created = await scope.ServiceProvider
+            .GetRequiredService<AuthBootstrapService>()
+            .EnsureBootstrapUserAsync(CancellationToken.None)
+            .ConfigureAwait(false);
+
+        if (created)
+        {
+            logger.LogInformation(
+                "Usuário inicial criado a partir da configuração Auth (senha gravada apenas como hash SHA256).");
+        }
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Falha ao criar o usuário inicial a partir da configuração Auth.");
+    }
 }
 
 

@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
 
@@ -17,7 +18,14 @@ namespace OrquestradorLucke.Worker.Logging;
 /// O hub é resolvido por conexão (o SignalR cria uma instância por invocação), portanto a injeção do
 /// sink Singleton é segura — nada de estado de conexão guardado em campo.
 /// </para>
+/// <para>
+/// <c>[Authorize]</c> na classe fecha o canal para anônimos: o log da aplicação expõe payload de
+/// tarefa e caminho de arquivo. Como o WebSocket não envia o cabeçalho <c>Authorization</c>, o token
+/// chega pela query string <c>access_token</c> (tratada no <c>OnMessageReceived</c> do JwtBearer, em
+/// <c>AddJwtAuthentication</c>) e vale somente para esta rota.
+/// </para>
 /// </remarks>
+[Authorize]
 public sealed class LogHub(SignalRLogSink sink, ILogger<LogHub> logger) : Hub
 {
     /// <inheritdoc />
