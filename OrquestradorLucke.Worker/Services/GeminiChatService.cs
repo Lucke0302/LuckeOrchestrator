@@ -7,9 +7,9 @@ namespace OrquestradorLucke.Worker.Services;
 
 /// <summary>
 /// Motor de chat do painel: envia a mensagem do operador ao endpoint <c>generateContent</c> do Google
-/// AI Studio e força o modelo a separar raciocínio e resposta final pelos rótulos em texto puro
-/// <c>PENSAMENTOS:</c> e <c>RESPOSTA:</c> — o C# fatia o texto nessa âncora e converte o raciocínio
-/// nas tags <c>&lt;think&gt;</c> que o painel isola, mostrando a resposta final fora delas.
+/// AI Studio e força o modelo a separar raciocínio e resposta final pelo delimitador técnico
+/// <c>FINAL_ANSWER_START</c> — o C# fatia o texto nele e converte o raciocínio nas tags
+/// <c>&lt;think&gt;</c> que o painel isola, mostrando a resposta final fora delas.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -65,13 +65,29 @@ public sealed class GeminiChatService(
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
 
     /// <summary>
-    /// Instrução de sistema que fixa o contrato de resposta baseado nas âncoras em texto puro
-    /// <c>PENSAMENTOS:</c> e <c>RESPOSTA:</c>: o raciocínio vem em bullet points sob a primeira e a
-    /// resposta final e polida vem sob a segunda — formato que modelos Instruct dominam nativamente,
-    /// sem tags XML nem JSON. O C# fatia o texto nessa âncora e monta as tags de pensamento do painel.
+    /// Delimitador técnico que separa o raciocínio da resposta final: o token em SCREAMING_SNAKE_CASE
+    /// não convida o modelo a comentar o próprio formato — os rótulos em texto puro ('PENSAMENTOS:' /
+    /// 'RESPOSTA:') estimulavam metalinguagem e a resposta acabava dentro de um bullet point.
+    /// </summary>
+    private const string AnswerDelimiter = "FINAL_ANSWER_START";
+
+    /// <summary>
+    /// Resíduo de markdown que fica colado ao delimitador quando o modelo o embrulha em negrito ou o
+    /// repete como título/bullet/legenda: <c>*</c>, <c>#</c>, <c>-</c>, <c>:</c> e espaço. É varrido das
+    /// duas bordas do corte — a do raciocínio e a da resposta — para o painel não exibir formatação
+    /// órfã; os sinais são os mesmos da limpeza de títulos do worker, com o dois-pontos a mais que o
+    /// modelo costuma colar no delimitador.
+    /// </summary>
+    private static readonly char[] ResidualMarkdownCharacters = ['*', '#', '-', ':', ' '];
+
+    /// <summary>
+    /// Instrução de sistema que fixa o contrato de resposta baseado no delimitador técnico
+    /// <c>FINAL_ANSWER_START</c>: o raciocínio vem em bullet points e a resposta final e polida vem logo
+    /// abaixo da linha do delimitador — token em SCREAMING_SNAKE_CASE que não estimula o modelo a
+    /// explicar o próprio formato. O C# fatia o texto nele e monta as tags de pensamento do painel.
     /// </summary>
     private const string ChainOfThoughtInstruction =
-        "Você é um assistente prestativo. Toda vez que você responder, você DEVE usar EXATAMENTE este formato de texto: primeiro a âncora 'PENSAMENTOS:' com seu raciocínio interno em bullet points e, em seguida, a âncora 'RESPOSTA:' com sua resposta final e polida para o usuário, sem bullets nem aspas.";
+        "You are a helpful AI assistant. First, write your internal reasoning in bullet points. When you finish reasoning, write the exact word FINAL_ANSWER_START on a new line and, below it, your final clean response to the user in Portuguese. Do NOT explain the format.";
 
     private readonly IConfiguration _configuration = configuration;
     private readonly ILogger<GeminiChatService> _logger = logger;
@@ -142,12 +158,12 @@ public sealed class GeminiChatService(
     {
         // Reforço do contrato no fim da fala do operador: alguns modelos (ex.: Gemma) ignoram a
         // system_instruction, então a mesma exigência é colada no próprio prompt — é a última coisa
-        // lida antes da geração, o que aumenta muito a aderência à âncora 'RESPOSTA:'.
-        var enhancedPrompt = $"{prompt}\n\n[MANDATORY INSTRUCTION: Você é um assistente prestativo. Toda vez que você responder, você DEVE usar EXATAMENTE este formato de texto:\n\nPENSAMENTOS:\n(seu raciocínio interno em bullet points)\n\nRESPOSTA:\n(sua resposta final e polida para o usuário)]";
+        // lida antes da geração, o que aumenta muito a aderência ao delimitador técnico.
+        var enhancedPrompt = $"{prompt}\n\n[MANDATORY INSTRUCTION: First, write your internal reasoning in bullet points. When finished, write the exact word FINAL_ANSWER_START on a new line. Below it, write your final clean response in Portuguese. Do NOT explain the format.]";
 
         using var request = new HttpRequestMessage(HttpMethod.Post, BuildEndpointUri(modelName))
         {
-            // A instrução de sistema fixa o contrato do cabeçalho de raciocínio e o 'contents' carrega a fala
+            // A instrução de sistema fixa o contrato do delimitador e o 'contents' carrega a fala
             // já reforçada do operador. As propriedades saem nomeadas exatamente como a API espera
             // (system_instruction), sem depender de naming policy.
             Content = JsonContent.Create(new
@@ -171,11 +187,11 @@ public sealed class GeminiChatService(
     }
 
     /// <summary>
-    /// Lê <c>candidates[0].content.parts[0].text</c> e fatia a resposta do modelo na âncora
-    /// <c>RESPOSTA:</c>: o que vem antes é o raciocínio (com o rótulo <c>PENSAMENTOS:</c> removido) e o
-    /// que vem depois é a resposta final já polida. O resultado sai no contrato de tags do painel
-    /// (<c>&lt;think&gt;{thoughts}&lt;/think&gt;</c> seguido da resposta). Texto ausente continua sendo
-    /// falha — a última tentativa escala para o fallback.
+    /// Lê <c>candidates[0].content.parts[0].text</c> e fatia a resposta do modelo no delimitador técnico
+    /// <c>FINAL_ANSWER_START</c>: o que vem antes é o raciocínio (bullet points) e o que vem depois é a
+    /// resposta final já polida, com o resíduo de markdown do delimitador varrido das duas bordas. O
+    /// resultado sai no contrato de tags do painel (<c>&lt;think&gt;{thoughts}&lt;/think&gt;</c> seguido
+    /// da resposta). Texto ausente continua sendo falha — a última tentativa escala para o fallback.
     /// </summary>
     /// <exception cref="InvalidOperationException">Quando o envelope não traz texto útil.</exception>
     private static string ExtractReplyText(string rawResponse)
@@ -192,20 +208,20 @@ public sealed class GeminiChatService(
 
         string thoughts;
         string answer;
-        var delimiter = "RESPOSTA:";
 
-        if (rawText.Contains(delimiter, StringComparison.OrdinalIgnoreCase))
+        if (rawText.Contains(AnswerDelimiter, StringComparison.OrdinalIgnoreCase))
         {
-            // Pega o índice onde começa a palavra RESPOSTA:
-            var delimiterIndex = rawText.IndexOf(delimiter, StringComparison.OrdinalIgnoreCase);
+            var delimiterIndex = rawText.IndexOf(AnswerDelimiter, StringComparison.OrdinalIgnoreCase);
 
-            // Tudo que vem antes é pensamento (removemos a palavra PENSAMENTOS: se ela existir)
-            thoughts = rawText.Substring(0, delimiterIndex)
-                              .Replace("PENSAMENTOS:", "", StringComparison.OrdinalIgnoreCase)
-                              .Trim();
+            // Tudo que vem antes do delimitador é o raciocínio; o TrimEnd varre o resíduo que sobra
+            // quando o modelo embrulha o token em negrito — o '**' de abertura cai neste trecho.
+            thoughts = rawText.Substring(0, delimiterIndex).TrimEnd(ResidualMarkdownCharacters).Trim();
 
-            // Tudo que vem depois é a resposta limpa
-            answer = rawText.Substring(delimiterIndex + delimiter.Length).Trim();
+            // Tudo que vem depois é a resposta: o '**' de fechamento e qualquer bullet/título colado ao
+            // delimitador saem no TrimStart, e o Trim final descarta as quebras de linha remanescentes.
+            answer = rawText.Substring(delimiterIndex + AnswerDelimiter.Length)
+                            .TrimStart(ResidualMarkdownCharacters)
+                            .Trim();
         }
         else
         {
