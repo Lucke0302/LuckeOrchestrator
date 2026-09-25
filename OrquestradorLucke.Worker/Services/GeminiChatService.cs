@@ -7,9 +7,9 @@ namespace OrquestradorLucke.Worker.Services;
 
 /// <summary>
 /// Motor de chat do painel: envia a mensagem do operador ao endpoint <c>generateContent</c> do Google
-/// AI Studio e força o modelo a separar raciocínio e resposta final pelo delimitador
-/// <c>&lt;FIM_DO_RACIOCINIO&gt;</c> — o C# converte isso nas tags <c>&lt;think&gt;</c> que o painel
-/// isola, mostrando a resposta final fora delas.
+/// AI Studio e força o modelo a separar raciocínio e resposta final pelo cabeçalho Markdown
+/// <c>### Resposta</c> — o C# converte isso nas tags <c>&lt;think&gt;</c> que o painel isola,
+/// mostrando a resposta final fora delas.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -65,13 +65,13 @@ public sealed class GeminiChatService(
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
 
     /// <summary>
-    /// Instrução de sistema que fixa o contrato de resposta baseado no delimitador
-    /// <c>&lt;FIM_DO_RACIOCINIO&gt;</c>: o raciocínio vem em bullet points e a resposta final limpa vem
-    /// logo abaixo da tag. O C# converte isso nas tags de pensamento do painel, sem depender de o
-    /// modelo emitir XML ou JSON.
+    /// Instrução de sistema que fixa o contrato de resposta baseado no cabeçalho Markdown
+    /// <c>### Resposta</c>: o raciocínio vem em bullet points e a resposta final limpa vem logo abaixo
+    /// do cabeçalho — formato que modelos Instruct dominam nativamente, sem tags XML nem JSON. O C#
+    /// converte isso nas tags de pensamento do painel.
     /// </summary>
     private const string ChainOfThoughtInstruction =
-        "Você é um assistente prestativo. Faça todo o seu raciocínio natural em bullet points. Ao terminar, escreva OBRIGATORIAMENTE a tag exata <FIM_DO_RACIOCINIO> e, logo abaixo dela, a sua resposta final limpa para o usuário em português, sem bullets e sem aspas.";
+        "You are a helpful AI assistant. 1. Write your internal reasoning in bullet points. 2. When you finish reasoning, write EXACTLY the markdown header '### Resposta' on a new line. 3. Write your final, clean response to the user in Portuguese, without bullets or quotes.";
 
     private readonly IConfiguration _configuration = configuration;
     private readonly ILogger<GeminiChatService> _logger = logger;
@@ -143,11 +143,11 @@ public sealed class GeminiChatService(
         // Reforço do contrato no fim da fala do operador: alguns modelos (ex.: Gemma) ignoram a
         // system_instruction, então a mesma exigência é colada no próprio prompt — é a última coisa
         // lida antes da geração, o que aumenta muito a aderência ao delimitador.
-        var enhancedPrompt = $"{prompt}\n\n[MANDATORY INSTRUCTION: 1. Faça todo o seu raciocínio natural em bullet points. 2. Ao terminar, escreva OBRIGATORIAMENTE a tag exata: <FIM_DO_RACIOCINIO> 3. Logo abaixo da tag, escreva a sua resposta final limpa para o usuário.]";
+        var enhancedPrompt = $"{prompt}\n\n[MANDATORY INSTRUCTION: 1. Write your internal reasoning in bullet points. 2. When you finish reasoning, write EXACTLY the markdown header '### Resposta' on a new line. 3. Write your final, clean response to the user in Portuguese.]";
 
         using var request = new HttpRequestMessage(HttpMethod.Post, BuildEndpointUri(modelName))
         {
-            // A instrução de sistema fixa o contrato do delimitador de raciocínio e o 'contents' carrega a fala
+            // A instrução de sistema fixa o contrato do cabeçalho de raciocínio e o 'contents' carrega a fala
             // já reforçada do operador. As propriedades saem nomeadas exatamente como a API espera
             // (system_instruction), sem depender de naming policy.
             Content = JsonContent.Create(new
@@ -171,9 +171,9 @@ public sealed class GeminiChatService(
     }
 
     /// <summary>
-    /// Lê <c>candidates[0].content.parts[0].text</c> e divide a resposta do modelo pelo delimitador
-    /// <c>&lt;FIM_DO_RACIOCINIO&gt;</c>: o que vem antes é o raciocínio (bullet points) e o que vem
-    /// depois é a resposta final já limpa. O resultado sai no contrato de tags do painel
+    /// Lê <c>candidates[0].content.parts[0].text</c> e divide a resposta do modelo pelo cabeçalho
+    /// Markdown <c>### Resposta</c>: o que vem antes é o raciocínio (bullet points) e o que vem depois
+    /// é a resposta final já limpa. O resultado sai no contrato de tags do painel
     /// (<c>&lt;think&gt;{thoughts}&lt;/think&gt;</c> seguido da resposta). Texto ausente continua sendo
     /// falha — a última tentativa escala para o fallback.
     /// </summary>
@@ -192,7 +192,7 @@ public sealed class GeminiChatService(
 
         string thoughts;
         string answer;
-        var delimiter = "<FIM_DO_RACIOCINIO>";
+        var delimiter = "### Resposta";
 
         if (rawText.Contains(delimiter))
         {
