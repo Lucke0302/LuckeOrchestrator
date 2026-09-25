@@ -2,19 +2,22 @@
 
 Você é um agente desenvolvedor atuando no projeto "Orquestrador Lucke", um Worker Service em .NET 10 utilizando Clean Architecture.
 
-## 1. Regras de Clean Architecture
+## 1. Comportamento do Agente e Ferramentas (CRÍTICO)
+- **Edição Cirúrgica (Replace in File):** É estritamente proibido reescrever arquivos inteiros ao realizar modificações. Utilize sempre a ferramenta de edição de blocos/linhas específicas (como `replace_in_file` ou diffs). Reescrever arquivos inteiros destrói a formatação, consome tokens excessivos e aumenta o risco de deleção acidental de código não relacionado.
+
+## 2. Regras de Clean Architecture
 - **Domain:** Apenas entidades, records, interfaces de repositório e enumeradores (como `TaskComplexity`). Zero dependências externas (sem pacotes NuGet de infraestrutura ou Entity Framework).
 - **Application:** Casos de uso, DTOs, interfaces de serviços externos (ex: `ILLMProvider`, `IGitHubService`). Não pode conhecer detalhes de implementação.
 - **Infrastructure:** Implementações reais (PostgreSQL, Octokit, adaptadores do Google AI Studio). É o único lugar onde o Entity Framework e chamadas HTTP externas devem existir.
 - **Worker (Host):** Apenas injeção de dependência (DI), configuração de IOptions e o `BackgroundService`.
 
-## 2. Padrões de Código e Gerenciamento de Memória
+## 3. Padrões de Código e Gerenciamento de Memória
 - **Zero Hardcoding:** É estritamente proibido colocar URLs, tokens, chaves de API ou caminhos de rede hardcoded no código. Utilize o padrão de `IOptions<T>` e variáveis de ambiente.
 - **Memory Leaks:** Em serviços de background (`BackgroundService`), NUNCA injete serviços Scoped (como DbContext) diretamente no construtor. Utilize `IServiceScopeFactory` para criar e descartar escopos (using) a cada iteração do laço assíncrono.
 - **HttpClient:** Não instancie `new HttpClient()`. Sempre utilize `IHttpClientFactory` ou Typed Clients registrados na injeção de dependência para evitar o esgotamento de sockets.
 - **Cancelamento:** Todos os métodos assíncronos devem aceitar e repassar um `CancellationToken`.
 
-## 3. Contexto de Negócio Obrigatório
-- **MoE (Mixture of Experts):** O sistema possui um roteador dinâmico de modelos baseado em um enumerador de complexidade[cite: 1].
-- **Mecânica de Frustração:** Falhas (como erros de compilação ou retornos vazios) devem incrementar um medidor de frustração. Ao atingir o limite, o circuito desarma e passa a tarefa para o modelo mais robusto (Gemini 3.1 Flash Lite)[cite: 1].
+## 4. Contexto de Negócio Obrigatório
+- **MoE (Mixture of Experts):** O sistema possui um roteador dinâmico de modelos baseado em um enumerador de complexidade.
+- **Mecânica de Frustração:** Falhas (como erros de compilação ou retornos vazios) devem incrementar um medidor de frustração. Ao atingir o limite, o circuito desarma e passa a tarefa para o modelo mais robusto (Gemini 3.1 Flash Lite).
 - **GitHub Bot:** A interação com o GitHub será feita via uma conta de agente autônomo. As operações de Git (Branch, Commit, PR) devem ser tratadas como um serviço isolado (`IGitHubService`).

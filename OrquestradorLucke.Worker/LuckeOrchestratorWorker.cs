@@ -1,9 +1,12 @@
 using System.Text;
+using System.Text.Json;
 using Microsoft.Extensions.Options;
 using OrquestradorLucke.Application.Configuration;
 using OrquestradorLucke.Application.Interfaces;
+using OrquestradorLucke.Application.Models;
 using OrquestradorLucke.Application.Services;
 using OrquestradorLucke.Domain;
+using OrquestradorLucke.Infrastructure.Models;
 using OrquestradorLucke.Worker.Configuration;
 
 namespace OrquestradorLucke.Worker;
@@ -13,8 +16,8 @@ namespace OrquestradorLucke.Worker;
 /// dependência (DbContext, adapters, Typed Clients) carregue estado entre execuções — e percorre o
 /// ciclo completo: indexação do RAG, dequeue da fila, recuperação do contexto da própria base de
 /// código, roteamento MoE da complexidade, geração dos arquivos pelo expert (um JSON estrito
-/// caminho → conteúdo), sumarização da descrição do pull request e entrega da branch/commit/PR pela
-/// conta de agente autônomo.
+/// caminho → conteúdo), sumarização do título/descrição do pull request e entrega da
+/// branch/commit/PR pela conta de agente autônomo.
 /// </summary>
 /// <remarks>
 /// Falhas de geração alimentam o <see cref="FrustrationTracker"/> do daemon: cada motivo é guardado
@@ -25,6 +28,7 @@ namespace OrquestradorLucke.Worker;
 /// </remarks>
 public sealed class LuckeOrchestratorWorker(
     IServiceScopeFactory scopeFactory,
+    FrustrationTracker frustrationTracker,
     ILogger<LuckeOrchestratorWorker> logger) : BackgroundService
 {
     /// <summary>Prefixo da branch criada para a tarefa (ex.: <c>feat/task-{id}</c>).</summary>
@@ -39,16 +43,28 @@ public sealed class LuckeOrchestratorWorker(
     /// </summary>
     private const int MaxSummaryContentLengthPerFile = 2000;
 
-    /// <summary>Instante (UTC) do último ciclo de indexação concluído — governa a cadência configurada.</summary>
-    private DateTimeOffset _lastIndexingAtUtc = DateTimeOffset.MinValue;
+    /// <summary>
+    /// Limite de caracteres da prévia da resposta bruta do sumarizador registrada no log quando o parse
+    /// do resumo falha: é essa evidência que diz o que o modelo devolveu fora do contrato.
+    /// </summary>
+    private const int SummaryLogPreviewLength = 500;
+
+    /// <summary>Tamanho máximo do título do pull request (títulos longos são truncados na UI do GitHub).</summary>
+    private const int MaxPullRequestTitleLength = 72;
 
     /// <summary>
-    /// Medidor de frustração do daemon: acumula as falhas de geração entre iterações e é zerado no
-    /// primeiro sucesso (o circuito volta a armar). Vive no campo do <see cref="BackgroundService"/>
-    /// — e não no escopo da iteração — porque cada tarefa tem uma única tentativa por ciclo: um
-    /// contador local nunca alcançaria <c>Frustration:MaxFailures</c> e o overdrive jamais dispararia.
+    /// Desserialização do resumo do pull request: os nomes em <c>camelCase</c> do JSON
+    /// (<c>{"titulo": ..., "descricao": ...}</c>) casam com as propriedades do record sem depender de
+    /// <c>JsonNamingPolicy</c>. A instância é estática porque <see cref="JsonSerializerOptions"/> só é
+    /// imutável (e segura para uso concorrente) depois da primeira serialização.
     /// </summary>
-    private FrustrationTracker? _frustrationTracker;
+    private static readonly JsonSerializerOptions SummarySerializerOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
+    /// <summary>Instante (UTC) do último ciclo de indexação concluído — governa a cadência configurada.</summary>
+    private DateTimeOffset _lastIndexingAtUtc = DateTimeOffset.MinValue;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -68,7 +84,6 @@ public sealed class LuckeOrchestratorWorker(
             var embeddingProvider = services.GetRequiredService<IEmbeddingProvider>();
 
             var options = services.GetRequiredService<IOptions<OrchestratorWorkerOptions>>().Value;
-            var frustrationSettings = services.GetRequiredService<IOptions<FrustrationSettings>>().Value;
 
             // RAG: mantém o índice vetorial da base de código atualizado antes de processar a fila.
             await TryIndexCodebaseAsync(codeIndexer, options, stoppingToken).ConfigureAwait(false);
@@ -89,10 +104,11 @@ public sealed class LuckeOrchestratorWorker(
                 continue;
             }
 
-            // Medidor de frustração compartilhado pelo daemon: cada falha de geração (retorno sem
-            // arquivos, JSON estrito inválido do modelo) aproxima o circuito do overdrive.
-            var frustrationTracker = _frustrationTracker ??= new FrustrationTracker(Math.Max(1, frustrationSettings.MaxFailures));
-
+            // Medidor de frustração do daemon (Singleton, compartilhado com a API de revisão): cada falha
+            // de geração (retorno sem arquivos, JSON estrito inválido do modelo) e cada rejeição do
+            // revisor aproxima o circuito do overdrive. Vive fora do escopo da iteração — um contador
+            // local nunca alcançaria Frustration:MaxFailures, já que cada tarefa tem uma tentativa por
+            // ciclo — e é zerado no primeiro sucesso.
             try
             {
                 // Cérebro (MoE): o roteador decide o expert pela complexidade e pela cota ativa de cada modelo.
@@ -191,8 +207,11 @@ public sealed class LuckeOrchestratorWorker(
                             stoppingToken)
                         .ConfigureAwait(false);
 
-                    // Descrição do PR: sumarizada por um expert rápido a partir da tarefa e dos artefatos.
-                    var pullRequestDescription = await BuildPullRequestSummaryAsync(
+                    // Título e descrição do PR: sumarizados por um expert rápido a partir da tarefa e
+                    // dos artefatos. Sem resposta utilizável, o resumo determinístico entra no lugar —
+                    // com o motivo do parse e a prévia bruta no log — sem derrubar a entrega já
+                    // commitada.
+                    var pullRequestSummary = await BuildPullRequestSummaryAsync(
                             taskRouter,
                             task,
                             artifacts,
@@ -202,8 +221,8 @@ public sealed class LuckeOrchestratorWorker(
                     var pullRequestUrl = await gitHubService
                         .OpenPullRequestAsync(
                             branchName,
-                            $"feat(task-{task.Id})",
-                            pullRequestDescription,
+                            pullRequestSummary.Titulo,
+                            pullRequestSummary.Descricao,
                             stoppingToken)
                         .ConfigureAwait(false);
 
@@ -489,8 +508,13 @@ public sealed class LuckeOrchestratorWorker(
             cancellationToken);
 
     /// <summary>
+    /// Título padrão do pull request, usado quando o expert não devolve um título utilizável.
+    /// </summary>
+    private static string BuildPullRequestTitle(AgentTask task) => $"feat(task-{task.Id})";
+
+    /// <summary>
     /// Corpo padrão do pull request: identifica a tarefa de origem e reproduz o payload recebido.
-    /// Usado quando a sumarização pelo expert não produz texto.
+    /// Usado quando a sumarização pelo expert não produz o JSON do resumo.
     /// </summary>
     private static string BuildPullRequestDescription(AgentTask task)
         => $"Entrega automática da tarefa `{task.Id}` pelo orquestrador Lucke."
@@ -615,38 +639,56 @@ public sealed class LuckeOrchestratorWorker(
     }
 
     /// <summary>
-    /// Gera a descrição do pull request com um expert rápido (complexidade baixa): sumarização não
-    /// exige raciocínio pesado e a cota consumida aqui não disputa a cadeia principal da tarefa.
+    /// Gera o título e o corpo do pull request com um expert rápido (complexidade baixa): sumarização
+    /// não exige raciocínio pesado e a cota consumida aqui não disputa a cadeia principal da tarefa.
     /// </summary>
     /// <remarks>
     /// Falhas do sumarizador são absorvidas de propósito: a entrega já foi commitada, e devolver a
     /// tarefa para a fila (como faria o tratamento de cota do laço) recriaria branch/commit no ciclo
-    /// seguinte. Sem resumo — inclusive quando o expert devolve algo que não é o JSON de arquivos e
-    /// o parse falha —, o corpo do PR recebe a descrição determinística.
+    /// seguinte. O parse aplica a mesma limpeza de markdown dos artefatos
+    /// (<see cref="LlmPayloadSanitizer.SanitizeJson"/>) antes de desserializar
+    /// <see cref="PullRequestSummary"/>, e qualquer resposta fora do contrato — exceção ou JSON sem
+    /// <c>descricao</c> — passa por <see cref="BuildFallbackPullRequestSummary"/>, que registra o
+    /// motivo e a prévia da resposta bruta antes de devolver o resumo determinístico.
     /// </remarks>
-    private async Task<string> BuildPullRequestSummaryAsync(
+    /// <returns>Resumo pronto para o pull request; nunca vazio — sem resposta utilizável, o padrão.</returns>
+    private async Task<PullRequestSummary> BuildPullRequestSummaryAsync(
         ITaskRouter taskRouter,
         AgentTask task,
         IReadOnlyDictionary<string, string> artifacts,
         CancellationToken stoppingToken)
     {
+        string? rawSummary = null;
+
         try
         {
             var summaryProvider = taskRouter.ResolveProvider(TaskComplexity.Baixo);
 
-            var summaryArtifacts = await summaryProvider
-                .GenerateCodeAsync(BuildPullRequestSummaryPrompt(task, artifacts), string.Empty, stoppingToken)
+            rawSummary = await summaryProvider
+                .GeneratePullRequestSummaryAsync(BuildPullRequestSummaryPrompt(task, artifacts), string.Empty, stoppingToken)
                 .ConfigureAwait(false);
 
-            // O expert responde sob o mesmo contrato JSON da geração (caminho → conteúdo), então o
-            // resumo é o texto útil devolvido — concatenado quando veio distribuído em mais de um valor.
-            var summary = string.Join(
-                Environment.NewLine,
-                summaryArtifacts.Values.Where(value => !string.IsNullOrWhiteSpace(value)));
+            var summary = ParsePullRequestSummary(rawSummary);
 
-            return string.IsNullOrWhiteSpace(summary)
-                ? BuildPullRequestDescription(task)
-                : summary.Trim();
+            if (string.IsNullOrWhiteSpace(summary.Descricao))
+            {
+                // JSON sintaticamente válido, porém sem o corpo do PR: vale o resumo padrão — com a
+                // mesma auditoria do parse quebrado, senão o motivo do fallback se perde no log.
+                return BuildFallbackPullRequestSummary(
+                    task,
+                    rawSummary,
+                    "o JSON do resumo não trouxe \"descricao\" aproveitável");
+            }
+
+            var title = NormalizePullRequestTitle(summary.Titulo);
+
+            // Título ausente (ou reduzido a marcações de markdown) cai no padrão determinístico da
+            // tarefa; o corpo vem do contrato JSON.
+            return summary with
+            {
+                Descricao = summary.Descricao.Trim(),
+                Titulo = string.IsNullOrWhiteSpace(title) ? BuildPullRequestTitle(task) : title
+            };
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
@@ -654,24 +696,106 @@ public sealed class LuckeOrchestratorWorker(
         }
         catch (Exception ex)
         {
-            logger.LogWarning(
-                ex,
-                "Não foi possível sumarizar o Pull Request da tarefa {TaskId}; usando a descrição padrão.",
-                task.Id);
-
-            return BuildPullRequestDescription(task);
+            return BuildFallbackPullRequestSummary(
+                task,
+                rawSummary,
+                $"falha do sumarizador ({ex.GetType().Name})",
+                ex);
         }
     }
 
     /// <summary>
-    /// Prompt de sumarização enviado ao expert rápido para o corpo do pull request: traz a tarefa e os
-    /// artefatos gerados, com o conteúdo de cada arquivo limitado por
+    /// Converte a resposta bruta do sumarizador no <see cref="PullRequestSummary"/>, aplicando a MESMA
+    /// limpeza de markdown usada no parse dos artefatos antes de chamar o
+    /// <c>JsonSerializer.Deserialize</c>.
+    /// </summary>
+    /// <exception cref="JsonException">
+    /// Quando a resposta — mesmo sanitizada — não é o objeto JSON do resumo. A exceção é o gatilho da
+    /// auditoria no chamador: o motivo e a prévia bruta vão para o log antes do resumo padrão.
+    /// </exception>
+    private static PullRequestSummary ParsePullRequestSummary(string? modelOutput)
+    {
+        // Cercas de markdown (```json ... ```) são a causa mais comum de parse quebrado: sem esta
+        // limpeza, um JSON correto dentro do bloco cairia no resumo determinístico.
+        var sanitized = LlmPayloadSanitizer.SanitizeJson(modelOutput);
+
+        // JSON "null" não pode devolver null: o record já inicializa os campos com vazio e o chamador
+        // decide o fallback por IsNullOrWhiteSpace.
+        return JsonSerializer.Deserialize<PullRequestSummary>(sanitized, SummarySerializerOptions)
+            ?? new PullRequestSummary();
+    }
+
+    /// <summary>
+    /// Resumo determinístico do pull request com a auditoria da falha de parse: registra o motivo e a
+    /// prévia da resposta bruta do modelo antes de devolver o título e o corpo padrão da tarefa.
+    /// </summary>
+    /// <remarks>
+    /// A prévia é limitada a <see cref="SummaryLogPreviewLength"/> caracteres e achatada em uma linha
+    /// porque o journal do Linux substitui corpos multilinha por <c>[blob data]</c>: sem essa
+    /// evidência, um fallback em produção não diz o que o modelo devolveu fora do contrato.
+    /// </remarks>
+    private PullRequestSummary BuildFallbackPullRequestSummary(
+        AgentTask task,
+        string? rawModelOutput,
+        string reason,
+        Exception? exception = null)
+    {
+        logger.LogWarning(
+            exception,
+            "Falha ao interpretar o resumo do Pull Request da tarefa {TaskId} ({Reason}); usando o resumo padrão. " +
+            "Prévia da resposta bruta do LLM ({Length} caractere(s)): {Preview}",
+            task.Id,
+            reason,
+            rawModelOutput?.Length ?? 0,
+            BuildSingleLinePreview(rawModelOutput, SummaryLogPreviewLength));
+
+        return new PullRequestSummary
+        {
+            Titulo = BuildPullRequestTitle(task),
+            Descricao = BuildPullRequestDescription(task)
+        };
+    }
+
+    /// <summary>
+    /// Ajusta o título devolvido pelo expert ao formato aceito pelo GitHub: uma única linha, sem
+    /// marcações de markdown nas pontas e dentro de <see cref="MaxPullRequestTitleLength"/> caracteres.
+    /// </summary>
+    private static string NormalizePullRequestTitle(string title)
+        => BuildSingleLinePreview(title, MaxPullRequestTitleLength).TrimStart('#', '*', '-', ' ').Trim();
+
+    /// <summary>
+    /// Achata o texto em uma única linha (espaços e quebras de linha viram separador) e o trunca no
+    /// limite informado: o daemon loga no journal, que descarta corpos multilinha como
+    /// <c>[blob data]</c> — a evidência precisa caber em uma linha.
+    /// </summary>
+    private static string BuildSingleLinePreview(string? text, int maxLength)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        var flattened = string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+        return flattened.Length <= maxLength
+            ? flattened
+            : flattened[..maxLength] + "...";
+    }
+
+    /// <summary>
+    /// Prompt de sumarização enviado ao expert rápido para o título e o corpo do pull request: traz a
+    /// tarefa e os artefatos gerados, com o conteúdo de cada arquivo limitado por
     /// <see cref="MaxSummaryContentLengthPerFile"/> — o resumo descreve a mudança, não o código inteiro.
     /// </summary>
+    /// <remarks>
+    /// O contrato JSON é repetido no fim do prompt (além da instrução fixada no adaptador) de propósito:
+    /// é ele que <see cref="ParsePullRequestSummary"/> desserializa, e uma resposta em texto livre cairia
+    /// no resumo determinístico.
+    /// </remarks>
     private static string BuildPullRequestSummaryPrompt(AgentTask task, IReadOnlyDictionary<string, string> artifacts)
     {
         var builder = new StringBuilder()
-            .Append("Crie um resumo curto em texto puro para a descrição de um Pull Request que implementou esta tarefa: ")
+            .Append("Descreva a mudança implementada para o título e a descrição de um Pull Request que implementou esta tarefa: ")
             .Append(task.Payload)
             .AppendLine()
             .Append("Arquivos gerados:");
@@ -690,6 +814,10 @@ public sealed class LuckeOrchestratorWorker(
                 .Append(content);
         }
 
-        return builder.ToString();
+        return builder
+            .AppendLine()
+            .AppendLine()
+            .Append("Responda apenas com o objeto JSON {\"titulo\": \"...\", \"descricao\": \"...\"}, sem cercas de markdown e sem texto fora do objeto.")
+            .ToString();
     }
 }

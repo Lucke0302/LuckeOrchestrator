@@ -3,9 +3,13 @@ using System.Text;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using OrquestradorLucke.Worker;
+using OrquestradorLucke.Worker.Configuration;
+using OrquestradorLucke.Worker.Endpoints;
+using OrquestradorLucke.Worker.Logging;
 
-// Host web (Kestrel) + BackgroundService: o daemon mantém o laço do orquestrador e passa a expor um
-// endpoint HTTP — o webhook do GitHub dispara a indexação sob demanda, no lugar do polling.
+// Host web (Kestrel) + BackgroundService: o daemon mantém o laço do orquestrador e passa a ser o
+// back-end em tempo real da aplicação — webhook do GitHub, API de gerenciamento/revisão e streaming
+// de logs pelo SignalR (o painel web não depende mais do DBeaver nem do journalctl).
 var builder = WebApplication.CreateBuilder(args);
 
 // Chave de configuração do segredo compartilhado com o GitHub e nome do cabeçalho de assinatura:
@@ -21,19 +25,28 @@ builder.Services.AddSystemd();
 
 // Composição da injeção de dependência: IOptions, um expert do Google AI Studio por modelo do
 // catálogo MoE, o expert de embeddings do RAG, Circuit Breaker de cota persistido (Scoped), política
-// de resiliência (Polly), a persistência PostgreSQL/pgvector e o canal de gatilho da indexação.
+// de resiliência (Polly), a persistência PostgreSQL/pgvector, o medidor de frustração do daemon e o
+// canal de gatilho da indexação.
 builder.Services.AddOrchestrator(builder.Configuration);
 
-// Laço do orquestrador (fila → expert → branch/commit/PR) e consumidor do gatilho de indexação, que
-// serializa as entregas do webhook (uma indexação por vez).
+// API de gerenciamento/revisão (Minimal APIs), streaming de logs (SignalR) e CORS do painel web.
+builder.Services.AddManagementApi(builder.Configuration);
+
+// Laço do orquestrador (fila → expert → branch/commit/PR), consumidor do gatilho de indexação (uma
+// indexação por vez) e publicador do log no hub (consumidor do canal do streaming).
 builder.Services.AddHostedService<LuckeOrchestratorWorker>();
 builder.Services.AddHostedService<IndexingBackgroundService>();
+builder.Services.AddHostedService<LogBroadcastService>();
 
 // Valida o grafo de DI antes de subir: dependência não registrada (ou serviço Scoped consumido pela
 // raiz) falha aqui, no start do daemon, em vez de aparecer só no journal da primeira iteração.
 DependencyInjectionSetup.ValidateOrchestratorComposition(builder.Services);
 
 var app = builder.Build();
+
+// CORS antes dos endpoints: o painel web (outra origem) alcança a API e o negotiate do hub. As
+// origens vêm de Cors:AllowedOrigins — sem origem liberada, o navegador simplesmente é bloqueado.
+app.UseCors(CorsSettings.PolicyName);
 
 // Webhook do GitHub: substitui o polling do indexador (Orchestrator:IndexingIntervalMinutes) por um
 // gancho pós-merge. Valida o HMAC-SHA256 do corpo bruto (X-Hub-Signature-256) contra o segredo
@@ -79,6 +92,14 @@ app.MapPost("/api/webhook/github", async (
 
     return Results.Accepted();
 });
+
+// API de gerenciamento/revisão do painel web: listar, enfileirar, aprovar (merge com o AdminToken) e
+// rejeitar (fecha o PR, alimenta o medidor de frustração e devolve a tarefa para Pendente).
+app.MapTaskEndpoints();
+
+// Streaming de logs: o hub entrega ao painel o log da aplicação em tempo real (o provider capturado
+// em AddManagementApi alimenta o canal que o LogBroadcastService publica aqui).
+app.MapHub<LogHub>(LogStreamContract.HubRoute);
 
 app.Run();
 

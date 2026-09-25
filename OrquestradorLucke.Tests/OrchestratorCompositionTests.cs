@@ -1,17 +1,23 @@
 using FluentAssertions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using OrquestradorLucke.Application.Interfaces;
+using OrquestradorLucke.Application.Services;
+using OrquestradorLucke.Domain;
 using OrquestradorLucke.Infrastructure.Data;
 using OrquestradorLucke.Infrastructure.Quota;
 using OrquestradorLucke.Worker;
+using OrquestradorLucke.Worker.Logging;
 
 namespace OrquestradorLucke.Tests;
 
 /// <summary>
 /// Valida o grafo de injeção de dependência do daemon com a composição real do host: IOptions, um
 /// expert por modelo do catálogo MoE, Circuit Breaker de cota persistido (Scoped), índice do RAG,
-/// canal de gatilho da indexação e os dois BackgroundServices.
+/// canal de gatilho da indexação, medidor de frustração compartilhado, streaming de logs (SignalR) e
+/// os três BackgroundServices.
 /// </summary>
 /// <remarks>
 /// A validação é a mesma que o host executa no start (<c>ValidateOnBuild</c> +
@@ -24,14 +30,73 @@ public sealed class OrchestratorCompositionTests
     [Fact]
     public void AddOrchestrator_DeveComporOGrafoCompletoSemDependenciaFaltante()
     {
-        var services = new ServiceCollection();
+        var services = CreateHostServices();
 
-        services.AddLogging();
         services.AddOrchestrator(CreateConfiguration());
+        services.AddManagementApi(CreateConfiguration());
 
-        // Registrados em Program: o consumidor do canal e o laço do orquestrador.
+        // Registrados em Program: o consumidor do canal, o laço do orquestrador e o publicador do log.
         services.AddHostedService<LuckeOrchestratorWorker>();
         services.AddHostedService<IndexingBackgroundService>();
+        services.AddHostedService<LogBroadcastService>();
+
+        var act = () => DependencyInjectionSetup.ValidateOrchestratorComposition(services);
+
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void AddOrchestrator_DeveRegistrarOMedidorDeFrustracaoComoSingleton()
+    {
+        // O medidor é compartilhado pelo laço do daemon e pela API de revisão: dois escopos diferentes
+        // precisam enxergar o MESMO contador, senão a rejeição do revisor não alimenta o overdrive.
+        var services = CreateHostServices();
+
+        services.AddOrchestrator(CreateConfiguration());
+
+        var descriptor = services.Single(candidate => candidate.ServiceType == typeof(FrustrationTracker));
+
+        descriptor.Lifetime.Should().Be(ServiceLifetime.Singleton);
+
+        using var provider = services.BuildServiceProvider();
+        using var firstScope = provider.CreateScope();
+        using var secondScope = provider.CreateScope();
+
+        var tracker = provider.GetRequiredService<FrustrationTracker>();
+
+        firstScope.ServiceProvider.GetRequiredService<FrustrationTracker>().Should().BeSameAs(tracker);
+        secondScope.ServiceProvider.GetRequiredService<FrustrationTracker>().Should().BeSameAs(tracker);
+    }
+
+    [Fact]
+    public void AddManagementApi_DeveRegistrarOStreamingDeLogsEASessaoDeRevisao()
+    {
+        var services = CreateHostServices();
+
+        services.AddOrchestrator(CreateConfiguration());
+        services.AddManagementApi(CreateConfiguration());
+
+        services.Should().Contain(descriptor =>
+            descriptor.ServiceType == typeof(SignalRLogSink) &&
+            descriptor.Lifetime == ServiceLifetime.Singleton);
+
+        services.Should().Contain(descriptor =>
+            descriptor.ServiceType == typeof(ILoggerProvider) &&
+            descriptor.ImplementationType == typeof(SignalRLoggerProvider));
+
+        services.Should().Contain(descriptor =>
+            descriptor.ServiceType == typeof(TaskReviewService) &&
+            descriptor.Lifetime == ServiceLifetime.Scoped);
+    }
+
+    [Fact]
+    public void AddManagementApi_SemOrigensDeCors_NaoDeveLiberarOrigemCruzada()
+    {
+        // Lista vazia (ou com entradas em branco) é normalizada: nenhuma origem liberada e o CORS não
+        // explode na construção da política.
+        var services = CreateHostServices();
+        services.AddOrchestrator(CreateConfiguration());
+        services.AddManagementApi(CreateConfiguration());
 
         var act = () => DependencyInjectionSetup.ValidateOrchestratorComposition(services);
 
@@ -41,9 +106,8 @@ public sealed class OrchestratorCompositionTests
     [Fact]
     public void AddOrchestrator_DeveRegistrarOCircuitBreakerDeCotaPersistidoComoScoped()
     {
-        var services = new ServiceCollection();
+        var services = CreateHostServices();
 
-        services.AddLogging();
         services.AddOrchestrator(CreateConfiguration());
 
         var descriptor = services.Single(candidate => candidate.ServiceType == typeof(IQuotaManager));
@@ -55,9 +119,8 @@ public sealed class OrchestratorCompositionTests
     [Fact]
     public void AddOrchestrator_DeveRegistrarOCanalDeIndexacaoComoSingleton()
     {
-        var services = new ServiceCollection();
+        var services = CreateHostServices();
 
-        services.AddLogging();
         services.AddOrchestrator(CreateConfiguration());
 
         var descriptor = services.Single(candidate => candidate.ServiceType == typeof(IndexingChannel));
@@ -68,11 +131,27 @@ public sealed class OrchestratorCompositionTests
     [Fact]
     public void AddOrchestrator_SemConnectionString_DeveFalharRapido()
     {
-        var services = new ServiceCollection();
+        var services = CreateHostServices();
 
         var act = () => services.AddOrchestrator(new ConfigurationBuilder().Build());
 
         act.Should().Throw<InvalidOperationException>().WithMessage("*ConnectionStrings*");
+    }
+
+    /// <summary>
+    /// Coleção de serviços com os registros que o host faz ANTES de qualquer serviço do usuário:
+    /// logging e o lifetime da aplicação. Sem o lifetime, o <c>ValidateOnBuild</c> acusaria o
+    /// <c>HttpConnectionManager</c> do SignalR (que o consome) como irresolúvel — um falso negativo
+    /// que não existe no host real.
+    /// </summary>
+    private static ServiceCollection CreateHostServices()
+    {
+        var services = new ServiceCollection();
+
+        services.AddLogging();
+        services.AddSingleton<IHostApplicationLifetime, StubApplicationLifetime>();
+
+        return services;
     }
 
     /// <summary>Configuração mínima exigida pela composição: a connection string é obrigatória.</summary>
@@ -88,4 +167,20 @@ public sealed class OrchestratorCompositionTests
                 ["Orchestrator:IndexingIntervalMinutes"] = "15"
             })
             .Build();
+
+    /// <summary>Lifetime de aplicação mínimo para a validação da DI (o host real registra o seu).</summary>
+    private sealed class StubApplicationLifetime : IHostApplicationLifetime
+    {
+        private readonly CancellationTokenSource _stopping = new();
+
+        public CancellationToken ApplicationStarted => CancellationToken.None;
+
+        public CancellationToken ApplicationStopping => _stopping.Token;
+
+        public CancellationToken ApplicationStopped => _stopping.Token;
+
+        public void StopApplication()
+        {
+        }
+    }
 }

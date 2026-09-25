@@ -58,4 +58,42 @@ public sealed class AgentTaskRepository(AppDbContext context) : IAgentTaskReposi
 
         await context.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    /// <inheritdoc />
+    public async Task AddTaskAsync(AgentTask task, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+
+        // O Id vem do domínio (Guid.NewGuid()) e nasce Pendente: o próximo ciclo do laço reivindica a
+        // linha pelo mesmo dequeue que atende as tarefas inseridas direto no banco.
+        context.AgentTasks.Add(task);
+
+        await context.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task<AgentTask?> GetTaskByIdAsync(Guid id, CancellationToken cancellationToken)
+    {
+        // Sem rastreamento: a tarefa é usada para decidir a revisão e a gravação posterior passa pelo
+        // Update condicional do repositório (o change tracker não disputa a instância devolvida).
+        return await context.AgentTasks
+            .AsNoTracking()
+            .FirstOrDefaultAsync(task => task.Id == id, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<AgentTask>> GetTasksAsync(int limit, CancellationToken cancellationToken)
+    {
+        var effectiveLimit = Math.Max(1, limit);
+
+        // Mais recentes primeiro: é a ordem que o painel web exibe e a leitura do índice é pequena
+        // (o teto de linhas vem do caso de uso, não desta consulta).
+        return await context.AgentTasks
+            .AsNoTracking()
+            .OrderByDescending(task => task.CriadoEm)
+            .Take(effectiveLimit)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+    }
 }

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using FluentAssertions;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -20,6 +21,17 @@ namespace OrquestradorLucke.Tests;
 public sealed class LuckeOrchestratorWorkerDeliveryTests
 {
     private const string PullRequestUrl = "https://github.com/acme/repo/pull/7";
+
+    /// <summary>
+    /// Resumo do PR devolvido pelo expert de sumarização: o JSON do contrato cercado por crases de
+    /// markdown, como os modelos de fato devolvem — é exatamente o caso que exige a sanitização antes
+    /// do parse no worker.
+    /// </summary>
+    private const string PullRequestSummaryJson = """
+        ```json
+        {"titulo": "feat(alvo): implementa a classe Alvo", "descricao": "## Resumo\n\nCria a classe `Alvo`.\n\n- src/Alvo.cs"}
+        ```
+        """;
 
     [Fact]
     public async Task ExecuteAsync_FalhaNoCommitDoGitHub_DeveMarcarFalhouLogarErroEAlimentarAFrustracao()
@@ -150,6 +162,127 @@ public sealed class LuckeOrchestratorWorkerDeliveryTests
         concludedTask.PullRequestUrl.Should().Be(PullRequestUrl);
     }
 
+    /// <summary>
+    /// O resumo do PR vem do contrato JSON do expert: a resposta cercada por crases de markdown passa
+    /// pela mesma sanitização dos artefatos antes do parse, então o título e o corpo do pull request são
+    /// os do LLM — sem cair no resumo determinístico.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ResumoEmJsonCercadoPorCrases_DevePreencherTituloECorpoDoPullRequest()
+    {
+        var task = new AgentTask
+        {
+            Payload = "Crie a classe Alvo.",
+            Complexidade = TaskComplexity.Baixo
+        };
+
+        var concluded = new TaskCompletionSource<AgentTask>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var provider = CreateProvider(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["src/Alvo.cs"] = "namespace Alvo; public class Alvo { }"
+        });
+
+        using var harness = CreateHarness(
+            task,
+            provider,
+            commitSucceeds: true,
+            onStatusUpdate: updated =>
+            {
+                if (updated.Status == AgentTaskStatus.Concluida)
+                {
+                    concluded.TrySetResult(updated);
+                }
+            });
+
+        await harness.Worker.StartAsync(CancellationToken.None);
+
+        try
+        {
+            await concluded.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        }
+        finally
+        {
+            await harness.Worker.StopAsync(CancellationToken.None);
+        }
+
+        // Título e corpo saem do JSON do contrato (o "```json" foi removido pelo sanitizador).
+        harness.GitHubService.Verify(
+            service => service.OpenPullRequestAsync(
+                $"feat/task-{task.Id}",
+                "feat(alvo): implementa a classe Alvo",
+                It.Is<string>(body => body.Contains("## Resumo") && body.Contains("src/Alvo.cs")),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // Sem fallback acionado: o aviso de resumo padrão não aparece no log.
+        harness.Logger.Messages.Should().NotContain(message => message.Contains("usando o resumo padrão"));
+    }
+
+    /// <summary>
+    /// Resposta fora do contrato do resumo (texto livre): o pull request recebe o título e o corpo
+    /// determinísticos e, antes disso, um único warning traz o motivo do parse E a prévia da string
+    /// bruta devolvida pelo LLM — a evidência que faltava para diagnosticar o fallback.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_ResumoForaDoContrato_DeveLogarPreviaBrutaEUsarResumoPadrao()
+    {
+        const string RawSummary = "Claro! Segue o resumo do Pull Request: implementa a classe Alvo, sem JSON.";
+
+        var task = new AgentTask
+        {
+            Payload = "Crie a classe Alvo.",
+            Complexidade = TaskComplexity.Baixo
+        };
+
+        var concluded = new TaskCompletionSource<AgentTask>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var provider = CreateProvider(
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["src/Alvo.cs"] = "namespace Alvo; public class Alvo { }"
+            },
+            RawSummary);
+
+        using var harness = CreateHarness(
+            task,
+            provider,
+            commitSucceeds: true,
+            onStatusUpdate: updated =>
+            {
+                if (updated.Status == AgentTaskStatus.Concluida)
+                {
+                    concluded.TrySetResult(updated);
+                }
+            });
+
+        await harness.Worker.StartAsync(CancellationToken.None);
+
+        try
+        {
+            await concluded.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        }
+        finally
+        {
+            await harness.Worker.StopAsync(CancellationToken.None);
+        }
+
+        // Parse quebrado: o PR sai com o título e o corpo padrão da tarefa.
+        harness.GitHubService.Verify(
+            service => service.OpenPullRequestAsync(
+                $"feat/task-{task.Id}",
+                $"feat(task-{task.Id})",
+                It.Is<string>(body => body.Contains("Entrega automática da tarefa")),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // Auditoria do fallback: motivo do parse e prévia da resposta bruta, no mesmo warning.
+        var warning = harness.Logger.Entries.Single(entry =>
+            entry.Level == LogLevel.Warning &&
+            entry.Message.Contains("Falha ao interpretar o resumo do Pull Request"));
+
+        warning.Message.Should().Contain(RawSummary);
+        warning.Exception.Should().BeOfType<JsonException>();
+    }
+
     /// <summary>Worker em execução com o grafo mínimo instrumentado (uma tarefa na fila por ciclo).</summary>
     private sealed record Harness(
         LuckeOrchestratorWorker Worker,
@@ -162,8 +295,13 @@ public sealed class LuckeOrchestratorWorkerDeliveryTests
         public void Dispose() => Services.Dispose();
     }
 
-    /// <summary>Expert fake: devolve os artefatos informados e identifica-se como um modelo do catálogo.</summary>
-    private static Mock<ILLMProvider> CreateProvider(Dictionary<string, string> artifacts)
+    /// <summary>
+    /// Expert fake: devolve os artefatos informados, o resumo do contrato para o pull request e
+    /// identifica-se como um modelo do catálogo.
+    /// </summary>
+    private static Mock<ILLMProvider> CreateProvider(
+        Dictionary<string, string> artifacts,
+        string pullRequestSummary = PullRequestSummaryJson)
     {
         var provider = new Mock<ILLMProvider>();
 
@@ -174,6 +312,12 @@ public sealed class LuckeOrchestratorWorkerDeliveryTests
                 It.IsAny<string>(),
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(artifacts);
+        provider
+            .Setup(candidate => candidate.GeneratePullRequestSummaryAsync(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(pullRequestSummary);
 
         return provider;
     }
@@ -268,12 +412,17 @@ public sealed class LuckeOrchestratorWorkerDeliveryTests
         });
         services.Configure<FrustrationSettings>(settings => settings.MaxFailures = 3);
 
+        // Medidor de frustração do daemon: Singleton compartilhado entre o laço e a API de revisão —
+        // no harness ele é registrado com o mesmo tipo de registro da composição real.
+        services.AddSingleton(new FrustrationTracker(limiteMaximo: 3));
+
         var serviceProvider = services.BuildServiceProvider();
         var logger = new RecordingLogger<LuckeOrchestratorWorker>();
 
         return new Harness(
             new LuckeOrchestratorWorker(
                 serviceProvider.GetRequiredService<IServiceScopeFactory>(),
+                serviceProvider.GetRequiredService<FrustrationTracker>(),
                 logger),
             logger,
             repository,

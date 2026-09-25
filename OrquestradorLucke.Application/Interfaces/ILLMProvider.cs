@@ -33,6 +33,27 @@ public interface ILLMProvider
     Task<Dictionary<string, string>> GenerateCodeAsync(string payload, string contextAnalysis, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Gera o resumo do pull request (título e descrição) a partir da tarefa e dos artefatos entregues.
+    /// </summary>
+    /// <remarks>
+    /// Devolve a saída <b>bruta</b> do modelo (já sem o Chain-of-Thought, como em
+    /// <see cref="AnalyzeContextAsync"/>) porque este contrato é de apresentação, não de código: o
+    /// chamador limpa as cercas de markdown e desserializa <see cref="Models.PullRequestSummary"/>
+    /// antes de preencher o pull request. O parse frouxo é deliberado — o resumo não pode derrubar uma
+    /// entrega já commitada, então uma resposta fora do contrato vira texto padrão com auditoria no
+    /// log, em vez de falha do expert.
+    /// </remarks>
+    /// <param name="payload">Tarefa e arquivos gerados, montado pelo chamador.</param>
+    /// <param name="contextAnalysis">Contexto recuperado do RAG (pode vir vazio).</param>
+    /// <param name="cancellationToken">Token de cancelamento da iteração do worker.</param>
+    /// <returns>
+    /// Saída bruta do modelo, instruído pela implementação a responder o JSON estrito
+    /// <c>{"titulo": "...", "descricao": "..."}</c>, sem nenhum campo além desses dois. String vazia
+    /// quando a resposta não traz payload.
+    /// </returns>
+    Task<string> GeneratePullRequestSummaryAsync(string payload, string contextAnalysis, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Avalia a falha da execução e retorna o diagnóstico a ser usado como
     /// contexto na próxima tentativa (retorno vazio indica ausência de diagnóstico).
     /// </summary>

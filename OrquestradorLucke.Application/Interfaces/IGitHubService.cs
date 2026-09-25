@@ -25,6 +25,33 @@ public interface IGitHubService
     Task<string> OpenPullRequestAsync(string branchName, string title, string description, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Mescla o pull request aberto cuja origem é a branch informada — a aprovação do revisor humano.
+    /// </summary>
+    /// <remarks>
+    /// Operação de <b>revisão</b>: usa a identidade administrativa (token do revisor), nunca a conta do
+    /// agente autônomo. A branch e o repositório são os mesmos das demais operações.
+    /// </remarks>
+    /// <param name="branchName">Branch de origem do pull request (ex.: <c>feat/task-{id}</c>).</param>
+    /// <param name="commitTitle">Título do commit de merge criado pelo GitHub.</param>
+    /// <param name="cancellationToken">Token de cancelamento da requisição HTTP.</param>
+    /// <returns>SHA do commit de merge devolvido pelo GitHub.</returns>
+    Task<string> MergePullRequestAsync(string branchName, string commitTitle, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Fecha (sem merge) o pull request aberto cuja origem é a branch informada, registrando o motivo
+    /// da rejeição como comentário no PR.
+    /// </summary>
+    /// <remarks>
+    /// Operação de <b>revisão</b>: usa a identidade administrativa (token do revisor). O fechamento é
+    /// idempotente — branch sem pull request aberto não é erro (nada a fechar) e o fluxo do revisor
+    /// segue para devolver a tarefa à fila.
+    /// </remarks>
+    /// <param name="branchName">Branch de origem do pull request (ex.: <c>feat/task-{id}</c>).</param>
+    /// <param name="reason">Motivo da rejeição, publicado como comentário do pull request.</param>
+    /// <param name="cancellationToken">Token de cancelamento da requisição HTTP.</param>
+    Task ClosePullRequestAsync(string branchName, string reason, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Lê os arquivos C# versionados na branch base do repositório (Git Data API, sem clonar o
     /// repositório localmente). É a fonte de dados do índice vetorial do RAG.
     /// </summary>

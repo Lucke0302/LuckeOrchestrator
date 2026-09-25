@@ -1,3 +1,5 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 using OrquestradorLucke.Application.Configuration;
 using OrquestradorLucke.Application.Interfaces;
@@ -9,6 +11,7 @@ using OrquestradorLucke.Infrastructure.Data;
 using OrquestradorLucke.Infrastructure.Data.Repositories;
 using OrquestradorLucke.Infrastructure.Quota;
 using OrquestradorLucke.Worker.Configuration;
+using OrquestradorLucke.Worker.Logging;
 using Polly;
 
 namespace OrquestradorLucke.Worker;
@@ -16,7 +19,8 @@ namespace OrquestradorLucke.Worker;
 /// <summary>
 /// Composição da injeção de dependência do host: bind dos IOptions, persistência PostgreSQL
 /// (EF Core + Npgsql + pgvector), um expert do Google AI Studio por modelo do catálogo MoE,
-/// Circuit Breaker de cota e política de resiliência (Polly).
+/// Circuit Breaker de cota, política de resiliência (Polly), o medidor de frustração compartilhado e a
+/// API de gerenciamento/revisão com o streaming de logs pelo SignalR.
 /// </summary>
 public static class DependencyInjectionSetup
 {
@@ -53,6 +57,13 @@ public static class DependencyInjectionSetup
         // reinício do daemon e vale para todas as instâncias que apontam para o mesmo banco.
         services.AddScoped<IQuotaManager, DbQuotaManager>();
 
+        // Medidor de frustração do daemon (Singleton): o laço registra falhas de geração/entrega e a
+        // revisão humana registra as rejeições — as duas portas alimentam o MESMO contador, que é o
+        // gatilho do overdrive. Vive na DI (e não em um campo do BackgroundService) justamente porque
+        // a API de review precisa da mesma instância que o laço.
+        services.AddSingleton(serviceProvider => new FrustrationTracker(
+            Math.Max(1, serviceProvider.GetRequiredService<IOptions<FrustrationSettings>>().Value.MaxFailures)));
+
         var resilience = ReadResilienceOptions(configuration);
 
         AddAiStudioExperts(services, resilience);
@@ -80,6 +91,57 @@ public static class DependencyInjectionSetup
         // IndexingBackgroundService consome — uma rajada de entregas vira um único pedido pendente e
         // o PostgreSQL recebe uma conexão por vez.
         services.AddSingleton<IndexingChannel>();
+
+        return services;
+    }
+
+    /// <summary>
+    /// Registra a API de gerenciamento/revisão (Minimal APIs), o streaming de logs pelo SignalR e o
+    /// CORS do painel web. Depende de <see cref="AddOrchestrator"/> (persistência, revisão e o medidor
+    /// de frustração) e é o que transforma o daemon no back-end em tempo real da aplicação.
+    /// </summary>
+    /// <param name="services">Coleção de serviços do host.</param>
+    /// <param name="configuration">Configuração da aplicação (appsettings/variáveis de ambiente).</param>
+    public static IServiceCollection AddManagementApi(this IServiceCollection services, IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        services.Configure<LogStreamingOptions>(configuration.GetSection(LogStreamingOptions.SectionName));
+        services.Configure<CorsSettings>(configuration.GetSection(CorsSettings.SectionName));
+
+        // Streaming de logs: o provider entra no pipeline de ILogger (ao lado de console/journald) e
+        // entrega os eventos a um canal não bloqueante; quem publica no hub é o BackgroundService.
+        services.AddSingleton<SignalRLogSink>();
+        services.AddSingleton<ILoggerProvider, SignalRLoggerProvider>();
+
+        // SignalR + protocolo JSON explícito: camelCase e nível do log como texto ("Information"), para
+        // que o contrato do fio não dependa dos defaults do framework.
+        services
+            .AddSignalR()
+            .AddJsonProtocol(options =>
+            {
+                options.PayloadSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
+                options.PayloadSerializerOptions.Converters.Add(new JsonStringEnumConverter());
+            });
+
+        // Casos de uso de revisão (accept/reject) e criação de tarefas: Scoped, junto do repositório e
+        // do adapter do GitHub que ele consome.
+        services.AddScoped<TaskReviewService>();
+
+        // CORS: o painel web roda em outra origem (localhost em desenvolvimento) e precisa alcançar a
+        // API e o negotiate do hub. As origens vêm da configuração — nada hardcoded.
+        var cors = ReadCorsSettings(configuration);
+
+        services.AddCors(options => options.AddPolicy(CorsSettings.PolicyName, policy =>
+        {
+            policy.AllowAnyHeader().AllowAnyMethod().AllowCredentials();
+
+            if (cors.AllowedOrigins.Length > 0)
+            {
+                policy.WithOrigins(cors.AllowedOrigins);
+            }
+        }));
 
         return services;
     }
@@ -198,5 +260,24 @@ public static class DependencyInjectionSetup
         return section.Exists()
             ? section.Get<HttpResilienceOptions>() ?? new HttpResilienceOptions()
             : new HttpResilienceOptions();
+    }
+
+    /// <summary>
+    /// Lê as origens liberadas no CORS na composição (a política é construída antes do host subir):
+    /// espaços são removidos, entradas vazias são descartadas e a lista é deduplicada — uma vírgula a
+    /// mais no appsettings não derruba o start.
+    /// </summary>
+    private static CorsSettings ReadCorsSettings(IConfiguration configuration)
+    {
+        var section = configuration.GetSection(CorsSettings.SectionName);
+        var settings = section.Exists() ? section.Get<CorsSettings>() ?? new CorsSettings() : new CorsSettings();
+
+        settings.AllowedOrigins = settings.AllowedOrigins
+            .Where(origin => !string.IsNullOrWhiteSpace(origin))
+            .Select(origin => origin.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return settings;
     }
 }

@@ -4,7 +4,10 @@ Agente autônomo de Engenharia de Software: um **worker service .NET 10** que co
 PostgreSQL**, decide qual modelo de linguagem executa cada tarefa (*Mixture of Experts*), recupera
 contexto da **própria base de código** (RAG com `pgvector`), entrega o resultado como
 **branch/commit/pull request** no GitHub e devolve o ciclo de vida da tarefa ao banco — sem
-intervenção humana e sem clonar o repositório na máquina.
+intervenção manual no banco e sem clonar o repositório na máquina. A entrega fica **aguardando revisão**:
+aprovar (merge) ou rejeitar (fechar o PR e devolver a tarefa à fila com o motivo) acontece pela API do
+próprio daemon, que também entrega o log em tempo real ao painel web pelo SignalR — sem DBeaver e sem
+`journalctl`.
 
 Roda como daemon (`systemd`). O **cérebro** é o roteador MoE com Circuit Breaker de cota, os
 **braços** são o `GitHubAdapter` (Git Data API via Octokit, tudo em memória) e a **memória de
@@ -19,9 +22,10 @@ trabalho** é o índice vetorial da base de código.
 - [Extração segura da resposta do modelo](#extração-segura-da-resposta-do-modelo)
 - [Git Data API em memória (Octokit)](#git-data-api-em-memória-octokit)
 - [RAG: contexto da própria base de código](#rag-contexto-da-própria-base-de-código)
-- [Sumarização da descrição do Pull Request](#sumarização-da-descrição-do-pull-request)
+- [Sumarização do Pull Request](#sumarização-do-pull-request)
 - [Fila e ciclo de vida da tarefa](#fila-e-ciclo-de-vida-da-tarefa)
 - [Host HTTP e webhook do GitHub](#host-http-e-webhook-do-github)
+- [Backend em tempo real: API de review e SignalR](#backend-em-tempo-real-api-de-review-e-signalr)
 - [Configuração e segredos](#configuração-e-segredos)
 - [Migrations (EF Core + pgvector)](#migrations-ef-core--pgvector)
 - [Resiliência do daemon](#resiliência-do-daemon)
@@ -45,7 +49,9 @@ trabalho** é o índice vetorial da base de código.
                  └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-O host também expõe `POST /api/webhook/github`, que dispara a indexação do RAG sob demanda (ver
+O host também expõe o **webhook do GitHub** (que dispara a indexação do RAG sob demanda), a **API de
+gerenciamento/revisão** das tarefas e o **hub de logs** consumido pelo painel web (ver
+[Backend em tempo real: API de review e SignalR](#backend-em-tempo-real-api-de-review-e-signalr)).
 [Host HTTP e webhook do GitHub](#host-http-e-webhook-do-github)).
 
 1. **Indexação (RAG)** — a cada `Orchestrator:IndexingIntervalMinutes` ou a cada webhook do GitHub
@@ -68,8 +74,8 @@ O host também expõe `POST /api/webhook/github`, que dispara a indexação do R
    convertida em falha e alimenta a mecânica de frustração (ver
    [Overdrive](#overdrive-escalada-para-o-modelo-mais-robusto)).
 6. **Entrega** — branch `feat/task-{id}`, commit com **todos** os arquivos do dicionário (sem caminho
-   fixo de artefato) e pull request com a descrição sumarizada por um expert rápido
-   (`TaskComplexity.Baixo`).
+   fixo de artefato) e pull request com título e corpo sumarizados por um expert rápido
+   (`TaskComplexity.Baixo`) sob o contrato JSON `{"titulo": ..., "descricao": ...}`.
 7. **Persistência** — a tarefa é gravada como `Concluida` com `Branch` e `PullRequestUrl`
    (o record imutável do Domain é mutado por `with`).
 
@@ -88,10 +94,10 @@ OrquestradorLucke.Worker          → DI, IOptions e BackgroundService (host do 
 | Camada | Responsabilidade | Exemplos |
 | --- | --- | --- |
 | **Domain** | Regras que não dependem de tecnologia | `AgentTask`, `CodeDocument`, `TaskComplexity`, `AgentTaskStatus`, `FrustrationTracker`, `QuotaExhaustedException`, `QuotaState` |
-| **Application** | Contratos e orquestração de caso de uso | `IAgentTaskRepository`, `ILLMProvider`, `IEmbeddingProvider`, `ICodeContextRepository`, `IGitHubService`, `ITaskRouter`, `IQuotaManager`, `CodebaseIndexerService` |
-| **Infrastructure** | Implementações reais | `AppDbContext` (+ migrations), `AgentTaskRepository`, `CodeContextRepository`, `GoogleAiStudioAdapter`, `GitHubAdapter`, `MoETaskRouter`, `DbQuotaManager`, `ModelCatalog` |
-| **Worker** | Composição e laço do daemon | `Program` (host HTTP + webhook), `DependencyInjectionSetup`, `LuckeOrchestratorWorker`, `OrchestratorWorkerOptions`, `IndexingChannel`, `IndexingBackgroundService` |
-| **Tests** | Testes automatizados (xUnit + Moq + FluentAssertions) | `MoETaskRouterTests`, `FrustrationTrackerTests`, `CodebaseIndexerServiceTests`, `OrchestratorCompositionTests`, `GoogleAiStudioAdapterEmbeddingTests`, `GoogleAiStudioAdapterParseTests`, `LuckeOrchestratorWorkerDeliveryTests` |
+| **Application** | Contratos e orquestração de caso de uso | `IAgentTaskRepository`, `ILLMProvider`, `IEmbeddingProvider`, `ICodeContextRepository`, `IGitHubService`, `ITaskRouter`, `IQuotaManager`, `CodebaseIndexerService`, `TaskReviewService`, `PullRequestSummary`, `AgentTaskResponse` |
+| **Infrastructure** | Implementações reais | `AppDbContext` (+ migrations), `AgentTaskRepository`, `CodeContextRepository`, `GoogleAiStudioAdapter`, `GitHubAdapter`, `MoETaskRouter`, `DbQuotaManager`, `ModelCatalog`, `AiStudioResponseReader`, `LlmPayloadSanitizer` |
+| **Worker** | Composição e laço do daemon | `Program` (host HTTP: webhook + API + hub), `DependencyInjectionSetup`, `LuckeOrchestratorWorker`, `TaskEndpoints`, `OrchestratorWorkerOptions`, `IndexingChannel`, `IndexingBackgroundService`, `SignalRLogSink`, `SignalRLoggerProvider`, `LogHub`, `LogBroadcastService` |
+| **Tests** | Testes automatizados (xUnit + Moq + FluentAssertions) | `MoETaskRouterTests`, `FrustrationTrackerTests`, `CodebaseIndexerServiceTests`, `OrchestratorCompositionTests`, `GoogleAiStudioAdapterEmbeddingTests`, `GoogleAiStudioAdapterParseTests`, `LuckeOrchestratorWorkerDeliveryTests`, `TaskReviewServiceTests`, `SignalRLogStreamingTests` |
 
 Regras respeitadas no código:
 
@@ -247,12 +253,14 @@ sistema de arquivos local.
 | --- | --- |
 | Branch de trabalho | `git/refs` de `GitHub:BaseBranch` → `POST git/refs` (`feat/task-{id}`) |
 | Commit | `GET git/ref/heads/{branch}` (referência → SHA) → `GET git/commits/{sha}` (commit + árvore base) → um blob por arquivo → `git/trees` com `BaseTree` (preserva o conteúdo já versionado) → `git/commits` → `PATCH git/refs` |
-| Pull request | `POST pulls` (base = `GitHub:BaseBranch`), corpo = descrição sumarizada |
+| Pull request | `POST pulls` (base = `GitHub:BaseBranch`), título e corpo do resumo JSON `{"titulo", "descricao"}` |
 | Indexação do RAG | `git/trees?recursive=1` + `git/blobs`, filtrando apenas blobs `.cs` com conteúdo textual |
 
 O Octokit 14 não expõe overloads com `CancellationToken` nas rotas de Git; por isso o adapter valida
 o token antes da árvore e a cada blob baixado. Blobs acima do limite da API voltam sem base64 e são
-ignorados na indexação. O token do agente autônomo (`GitHub:Token`) é obrigatório: o adapter falha
+ignorados na indexação. O token do agente autônomo (`GitHub:AgentToken`) é obrigatório: o adapter falha
+rápido na construção quando ele não está configurado. As operações de revisão (merge/fechamento de PR)
+usam o `GitHub:AdminToken` — ver [Dual-token](#dual-token-o-agente-entrega-o-revisor-aprova).
 rápido na construção quando ele não está configurado.
 
 A referência da branch é lida com o prefixo `heads/` (`GET git/ref/heads/feat/task-{id}`) e o commit
@@ -341,21 +349,29 @@ Embedding      ReadOnlyMemory<float>                                  embedding 
   como contexto. Sem índice, sem embedding ou com falha na busca, o worker apenas loga um aviso e
   segue com contexto vazio — o RAG é enriquecimento, não pré-requisito da tarefa.
 
-## Sumarização da descrição do Pull Request
+## Sumarização do Pull Request
 
-Depois de gerar os arquivos, o worker resolve um expert rápido (`TaskComplexity.Baixo`) e pede:
+Depois de gerar os arquivos, o worker resolve um expert rápido (`TaskComplexity.Baixo`) e pede o título
+e o corpo do PR:
 
-> "Crie um resumo curto em texto puro para a descrição de um Pull Request que implementou esta
-> tarefa: {payload}. Arquivos gerados: ### {caminho} {conteúdo}"
+> "Descreva a mudança implementada para o título e a descrição de um Pull Request que implementou esta
+> tarefa: {payload}. Arquivos gerados: ### {caminho} {conteúdo} … Responda apenas com o objeto JSON
+> `{"titulo": "...", "descricao": "..."}`, sem cercas de markdown"
 
 O conteúdo de cada arquivo entra limitado a 2000 caracteres (o resumo descreve a mudança, não o código
-inteiro, e um prompt gigante só consumiria contexto e cota). O expert responde sob o mesmo contrato
-JSON da geração, então o resumo é o texto útil devolvido — concatenado quando vem distribuído em mais
-de um valor.
+inteiro, e um prompt gigante só consumiria contexto e cota). O contrato é **JSON estrito**
+`{"titulo": "...", "descricao": "..."}`, fixado na instrução do adaptador
+(`PullRequestSummaryInstruction`) e repetido no fim do prompt do worker. O parse desserializa o record
+`PullRequestSummary` (Application) e alimenta o título e o corpo (*body*) do pull request: título vazio
+(ou só com marcações de markdown) cai em `feat(task-{id})`, normalizado para uma linha de até 72
+caracteres.
 
-A resposta vira o corpo (*body*) do pull request. Se o sumarizador falhar (cota, timeout), devolver
-vazio ou devolver algo que não é o JSON esperado, o PR usa a descrição determinística (`Entrega
-automática da tarefa …` + payload): a entrega já commitada não é desfeita por causa do resumo.
+O parse reaproveita a **mesma sanitização dos artefatos** (`SanitizeJsonPayload`, exposta ao host por
+`LlmPayloadSanitizer`): os modelos devolvem o objeto cercado por crases de markdown e, sem essa limpeza,
+um JSON correto cairia no fallback. Se o sumarizador falhar (cota, timeout), devolver vazio ou devolver
+algo fora do contrato (texto livre, JSON sem `descricao`), o PR usa o título e o corpo determinísticos
+(`Entrega automática da tarefa …` + payload) e o log recebe um `LogWarning` com o motivo do parse e a
+prévia da resposta bruta: a entrega já commitada nunca é desfeita por causa do resumo.
 
 ## Auditoria do parse e da entrega (fim do silêncio)
 
@@ -388,6 +404,12 @@ automática da tarefa …` + payload): a entrega já commitada não é desfeita 
 - **Trilha do Octokit:** criação de branch, commit (blobs, árvore, referência) e abertura do PR logam
   `LogInformation` com os SHAs/caminhos de cada etapa e `LogError` + rethrow em qualquer falha — o log
   mostra exatamente onde o fluxo parou.
+- **Fallback do resumo do PR com evidência:** quando o resumo do pull request não é o JSON do contrato
+  (exceção de parse ou ausência de `descricao`), o worker loga `LogWarning` com o motivo **e os
+  primeiros 500 caracteres da resposta bruta do LLM** (achatada em uma linha, porque o journal descarta
+  corpos multilinha) antes de usar o título/corpo padrão — sem isso um fallback em produção não diz o
+  que o modelo devolveu fora do contrato. O resumo **não** alimenta a frustração: a entrega já foi
+  commitada e a tarefa segue `Concluida`.
 
 ## Fila e ciclo de vida da tarefa
 
@@ -398,11 +420,14 @@ automática da tarefa …` + payload): a entrega já commitada não é desfeita 
 | `Concluida` | arquivos commitados e PR aberto; `Branch` e `PullRequestUrl` preenchidos |
 | `Falhou` | geração sem arquivos, resposta fora do JSON estrito, falha não recuperável (após a tentativa do overdrive, quando disparado) ou falha de entrega no GitHub (branch/commit/PR) |
 | `Cancelada` | interrompida por solicitação/desligamento |
+| `Aprovada` | revisão humana aprovou a entrega: o pull request foi mesclado com o `AdminToken` (a conta do agente não aprova o próprio PR) |
 
 O índice `ix_agent_tasks_status_criado_em` (`status`, `criado_em`) atende exatamente o dequeue:
 `WHERE status = 'Pendente' ORDER BY criado_em`. A tabela é a única interface com o resto do sistema —
 qualquer produtor pode inserir uma linha `Pendente` (com `payload` e `complexidade`) e o daemon a
-processa sem reinício.
+processa sem reinício — pela API (`POST /api/tasks`), que é o produtor natural do painel web, ou por um
+`INSERT` direto no banco. O status é gravado como texto (`varchar(16)`), então o valor novo `Aprovada`
+entrou **sem migration**: nenhuma coluna mudou, apenas o domínio passou a conhecer o estado de revisão.
 
 ## Host HTTP e webhook do GitHub
 
@@ -446,6 +471,106 @@ app.MapPost("/api/webhook/github", async (HttpContext context, IConfiguration co
 Endereço e porta vêm do host (Kestrel), não do código: defina `ASPNETCORE_URLS`
 (ex.: `ASPNETCORE_URLS=http://127.0.0.1:5080`) no unit do systemd — sem isso o Kestrel usa o default.
 
+## Backend em tempo real: API de review e SignalR
+
+O host deixou de ser apenas o webhook do GitHub: ele é o back-end em tempo real do painel web — as
+tarefas são consultadas e enfileiradas por HTTP, a revisão (aprovar/rejeitar) fecha o ciclo do pull
+request e o log do daemon chega ao navegador pelo SignalR, sem DBeaver e sem `journalctl`.
+
+### API de gerenciamento (Minimal APIs)
+
+| Rota | Efeito | Token |
+| --- | --- | --- |
+| `GET /api/tasks?limit=50` | lista as tarefas, da mais recente para a mais antiga (teto de 200 linhas) | — |
+| `POST /api/tasks` | recebe `{ "payload": "...", "complexidade": "Medio" }`, gera o UUID, insere `Pendente` e responde **200** com a tarefa | — |
+| `POST /api/tasks/{id}/accept` | mescla o pull request da tarefa e marca `Aprovada` | `AdminToken` |
+| `POST /api/tasks/{id}/reject` | recebe `{ "motivo": "..." }`, fecha o PR (motivo como comentário), alimenta o medidor de frustração e devolve a tarefa para `Pendente` | `AdminToken` |
+
+- **UUID e status nascem no domínio:** `POST /api/tasks` não inventa identificador nem status — o
+  `AgentTask` já chega com `Guid.NewGuid()` e `Pendente`, e o laço reivindica a linha no próximo ciclo
+  (sem reinício do host).
+- **`complexidade` é opcional** (`Baixo` por padrão) e o JSON da API aceita o enum como texto
+  (`"Medio"`, `"Aprovada"`): `ConfigureHttpJsonOptions` registra o `JsonStringEnumConverter` para o
+  binding e para a resposta.
+- **`accept`:** o merge é pedido pela branch da tarefa (`feat/task-{id}`) com o `AdminToken` e
+  `merged = false` (conflito, branch protegida, checks pendentes) é tratado como falha — a tarefa **não**
+  vira `Aprovada` sem merge. Tarefa inexistente ⇒ `404`; tarefa sem PR (falhou antes da entrega) ⇒ `409`;
+  recusa do GitHub ⇒ `502` com a mensagem original no corpo do `ProblemDetails`.
+- **`reject`:** fecha o PR (`state = closed`, com o motivo comentado) com o `AdminToken`, registra
+  `revisão humana rejeitou a entrega: {motivo}` no `FrustrationTracker` **compartilhado com o laço** — é
+  isso que aproxima o daemon do overdrive — e grava a tarefa de volta como `Pendente`. `Branch` e
+  `PullRequestUrl` são preservados: dizem qual entrega foi rejeitada, e a branch é reaproveitada na
+  reentrega. Rejeitar uma tarefa sem PR é válido (não há o que fechar): a falha entra no medidor e a
+  tarefa volta para a fila.
+- **Corpo inválido** (`payload` ou `motivo` em branco) ⇒ `400`. O log técnico sai pelo pipeline de
+  `ILogger` (console/journald **e** hub), não na resposta HTTP.
+
+### Streaming de logs (SignalR)
+
+```
+ILogger (qualquer categoria do host)
+   │  SignalRLoggerProvider — Singleton, [ProviderAlias("LogStream")], fila não bloqueante
+   ▼
+SignalRLogSink — Channel<LogStreamEntry> limitado (DropOldest) + retrovisor circular
+   │  LogBroadcastService (BackgroundService) — único que fala com o hub
+   ▼
+LogHub — rota /hubs/logs —► "log" (um evento) / "history" (retrovisor ao conectar)
+```
+
+- **Provider customizado:** o `SignalRLoggerProvider` entra no pipeline de `ILogger` ao lado do
+  console/journald (basta registrar `ILoggerProvider` na DI — o `LoggerFactory` do host resolve todos) e
+  converte cada evento em um `LogStreamEntry` (instante UTC, nível, categoria, mensagem já formatada e
+  `ToString()` da exceção). Nada é substituído: o journal continua recebendo tudo.
+- **Quem loga não espera:** a entrega ao provider é uma escrita em canal limitado; o envio ao hub (I/O de
+  rede) acontece no `LogBroadcastService`, um `BackgroundService` — o laço do orquestrador nunca fica
+  preso por causa de um painel lento ou desconectado.
+- **Sem realimentação:** todo envio roda com `SignalRLogSink.SuppressBroadcast()` ligado; se o SignalR
+  logar um erro de transporte durante o envio, o provider descarta esse evento — sem essa trava, uma
+  falha de envio geraria log que geraria envio, em laço infinito.
+- **Contrato do fio:** JSON em `camelCase` com o nível como texto —
+  `{ "timestampUtc": ..., "level": "Information", "category": "...", "message": "...", "exception": null }`.
+  Ao conectar, o cliente recebe o retrovisor no evento `history` e depois cada evento em `log`.
+- **`LogStreaming`:** `Enabled`, `MinimumLevel` (independe do filtro do journald), `QueueCapacity` (o
+  evento mais antigo é descartado quando a fila enche), `HistorySize` (retrovisor; `0` desliga) e
+  `MaxMessageLength` (mensagem truncada com `...`).
+
+```javascript
+const connection = new signalR.HubConnectionBuilder()
+    .withUrl('http://localhost:5080/hubs/logs')  // origem precisa estar em Cors:AllowedOrigins
+    .withAutomaticReconnect()
+    .build();
+
+connection.on('history', (entries) => entries.forEach(render));
+connection.on('log', render);
+
+await connection.start();
+```
+
+### Dual-token: o agente entrega, o revisor aprova
+
+| Token | Identidade | Operações |
+| --- | --- | --- |
+| `GitHub:AgentToken` | agente autônomo | branch, commit, abertura de PR e leitura da árvore (RAG) |
+| `GitHub:AdminToken` | revisor humano | merge e fechamento de PR (`accept`/`reject`) |
+
+- o `GitHubAdapter` mantém **dois** clientes Octokit (um por token) e escolhe pelo contexto da ação: a
+  entrega nunca usa a credencial de revisão e a revisão nunca usa a do agente;
+- **fail closed:** sem `AgentToken` o adapter falha na construção (como antes); sem `AdminToken` a
+  operação de revisão falha explicitamente (`InvalidOperationException`) em vez de reusar a credencial
+  do agente — um fallback silencioso anularia a segregação de funções;
+- `GitHub:MergeMethod` define a estratégia da aprovação (`Merge`, `Squash` ou `Rebase`); valor inválido
+  cai em `Merge` com aviso no log;
+- o `reject` é idempotente: branch sem PR aberto só registra um aviso (nada a fechar) e a tarefa volta
+  para a fila do mesmo jeito.
+
+### CORS
+
+`Cors:AllowedOrigins` lista as origens do painel (as portas usuais de desenvolvimento — `localhost` em
+`3000`/`4200`/`5173`/`8080` e os equivalentes em `127.0.0.1` — já vêm no `appsettings.json`); a política
+`LuckeWebClient` (`AllowAnyHeader` + `AllowAnyMethod` + `AllowCredentials`) é aplicada por
+`app.UseCors(...)` antes do webhook, da API e do hub, então o `negotiate` do SignalR também passa por
+ela. Lista vazia ⇒ nenhuma origem cruzada liberada (e nada quebra no start).
+
 ## Configuração e segredos
 
 `appsettings.json` (nenhum segredo em código):
@@ -456,20 +581,25 @@ Endereço e porta vêm do host (Kestrel), não do código: defina `ASPNETCORE_UR
 | `AiStudio:BaseUrl` / `ApiVersion` / `TimeoutSeconds` / `QuotaLockoutHours` | endpoint e limites do Google AI Studio |
 | `AiStudio:ApiKey` | **segredo** (variável de ambiente / user-secrets) |
 | `HttpResilience:RetryAttempts` / `BaseDelaySeconds` | política Polly (retry + backoff) |
-| `GitHub:Token` | **segredo** do agente autônomo |
+| `GitHub:AgentToken` | **segredo** do agente autônomo (entrega: branch, commit e PR) |
+| `GitHub:AdminToken` | **segredo** do revisor humano (merge e fechamento de PR na API) |
+| `GitHub:MergeMethod` | estratégia de merge da aprovação (`Merge`, `Squash` ou `Rebase`) |
 | `GitHub:Owner` / `Repository` / `BaseBranch` | repositório de trabalho e branch base |
 | `GitHub:WebhookSecret` | **segredo** do HMAC-SHA256 do webhook (variável de ambiente / user-secrets) |
 | `Frustration:MaxFailures` | falhas toleradas antes do overdrive (alimenta o histórico entregue ao overdrive) |
 | `Orchestrator:PollingIntervalSeconds` | cadência do laço quando a fila está vazia |
 | `Orchestrator:QuotaCooldownMinutes` | cooldown do laço quando toda a cadeia MoE está bloqueada |
 | `Orchestrator:IndexingIntervalMinutes` | cadência (rede de segurança) do indexador do RAG |
-| `ASPNETCORE_URLS` | endereço/porta do host HTTP que atende o webhook (default do Kestrel quando omitido) |
+| `ASPNETCORE_URLS` | endereço/porta do host HTTP que atende o webhook, a API e o hub (default do Kestrel quando omitido) |
+| `Cors:AllowedOrigins` | origens do painel web liberadas no CORS (API + `negotiate` do hub) |
+| `LogStreaming:Enabled` / `MinimumLevel` / `QueueCapacity` / `HistorySize` / `MaxMessageLength` | streaming de logs: liga/desliga, nível publicado, fila, retrovisor e truncamento |
 
 > **Atenção (systemd/Production):** user-secrets e `appsettings.Development.json` **não** são
-> carregados fora do ambiente Development. Em produção, `AiStudio:ApiKey`, `GitHub:Token`,
-> `GitHub:WebhookSecret`, `GitHub:Owner` e `GitHub:Repository` precisam vir de variáveis de ambiente do
-> unit (`AiStudio__ApiKey`, `GitHub__Token`, `GitHub__WebhookSecret`, `GitHub__Owner`,
-> `GitHub__Repository`), por exemplo via `EnvironmentFile=/etc/lucke/lucke.env`.
+> carregados fora do ambiente Development. Em produção, `AiStudio:ApiKey`, `GitHub:AgentToken`,
+> `GitHub:AdminToken`, `GitHub:WebhookSecret`, `GitHub:Owner` e `GitHub:Repository` precisam vir de
+> variáveis de ambiente do unit (`AiStudio__ApiKey`, `GitHub__AgentToken`, `GitHub__AdminToken`,
+> `GitHub__WebhookSecret`, `GitHub__Owner`, `GitHub__Repository`), por exemplo via
+> `EnvironmentFile=/etc/lucke/lucke.env`.
 
 ## Migrations (EF Core + pgvector)
 
@@ -546,6 +676,9 @@ Migrations existentes:
   robusto antes de desistir (ver [Overdrive](#overdrive-escalada-para-o-modelo-mais-robusto)).
 - **Reentrega idempotente**: branch e PR já existentes são reutilizados, então reprocessar uma tarefa
   não falha por causa do que já foi entregue.
+- **Rejeição na revisão**: o `reject` da API fecha o PR, registra o motivo no mesmo `FrustrationTracker`
+  do laço (a rejeição conta como falha para o overdrive) e devolve a tarefa para `Pendente` — o expert
+  mais robusto recebe o motivo apontado pelo revisor no próximo ciclo.
 - **Desligamento** (Ctrl+C / `systemctl stop`): a tarefa em execução volta para `Pendente` — a
   gravação usa `CancellationToken.None`, pois o token do host já está cancelado — e nada fica preso
   em `EmExecucao`.
@@ -560,17 +693,18 @@ Migrations existentes:
 ```powershell
 # 1) Segredos (development) — nunca no appsettings
 dotnet user-secrets set "AiStudio:ApiKey"       "<chave>"   --project OrquestradorLucke.Worker
-dotnet user-secrets set "GitHub:Token"          "<token>"   --project OrquestradorLucke.Worker
+dotnet user-secrets set "GitHub:AgentToken"     "<token do agente>"  --project OrquestradorLucke.Worker
+dotnet user-secrets set "GitHub:AdminToken"     "<token do revisor>" --project OrquestradorLucke.Worker
 dotnet user-secrets set "GitHub:WebhookSecret"  "<segredo>" --project OrquestradorLucke.Worker
 
 # 2) Banco: aplica as migrations (assume o DEFAULT_CONNECTION já configurado)
 $env:ConnectionStrings__DefaultConnection='Host=<host>;Database=lucke_db;Username=<user>;Password=<senha>'
 dotnet ef database update --project OrquestradorLucke.Infrastructure
 
-# 3) Daemon (o host sobe o laço do orquestrador e o host HTTP do webhook)
+# 3) Daemon (o host sobe o laço do orquestrador, o host HTTP do webhook, a API de review e o hub de logs)
 dotnet run --project OrquestradorLucke.Worker
 
-# 4) Enfileira uma tarefa (exemplo via psql)
+# 4) Enfileira uma tarefa pela API (o UUID e o status Pendente são gerados no domínio)
 INSERT INTO agent_tasks (id, payload, complexidade, status, criado_em)
 VALUES (gen_random_uuid(), 'Criar endpoint de cálculo de frete', 'Medio', 'Pendente', now());
 
@@ -581,6 +715,20 @@ $mac       = [System.Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF
 $signature = 'sha256=' + [Convert]::ToHexString($mac.ComputeHash([Text.Encoding]::UTF8.GetBytes($body))).ToLowerInvariant()
 Invoke-WebRequest -Method Post http://localhost:5000/api/webhook/github `
     -Body $body -ContentType 'application/json' -Headers @{ 'X-Hub-Signature-256' = $signature }
+
+# 6) API de gerenciamento/revisão (o mesmo host que atende o webhook)
+$base = 'http://localhost:5000'
+Invoke-RestMethod -Method Post "$base/api/tasks" -ContentType 'application/json' `
+    -Body '{"payload":"Criar endpoint de cálculo de frete","complexidade":"Medio"}'
+Invoke-RestMethod -Method Get  "$base/api/tasks?limit=20"
+
+$taskId = '<id devolvido pelo POST>'
+Invoke-RestMethod -Method Post "$base/api/tasks/$taskId/accept"      # merge do PR (AdminToken) ⇒ Aprovada
+Invoke-RestMethod -Method Post "$base/api/tasks/$taskId/reject" -ContentType 'application/json' `
+    -Body '{"motivo":"Faltou validação de entrada"}'                # fecha o PR + volta para Pendente
+
+# 7) Log em tempo real: o painel web conecta no hub (SignalR) e recebe os eventos "history"/"log"
+#    ws://localhost:5000/hubs/logs  (o negotiate sai em POST /hubs/logs/negotiate?negotiateVersion=1)
 ```
 
 Para rodar a suíte de testes: `dotnet test` (ou por projeto, como em
@@ -626,7 +774,9 @@ Os demais testes cobrem as melhorias arquiteturais:
   em árvore vazia;
 - `OrchestratorCompositionTests` — executa a mesma validação de DI que o host faz no start
   (`ValidateOnBuild`/`ValidateScopes`) sobre a composição real, além de fixar os tempos de vida de
-  `DbQuotaManager` (Scoped) e `IndexingChannel` (Singleton) e o fail fast da connection string;
+  `DbQuotaManager` (Scoped), `IndexingChannel` (Singleton), `FrustrationTracker` (Singleton, o **mesmo**
+  em qualquer escopo — é o que liga a rejeição da API ao overdrive do laço) e `TaskReviewService`
+  (Scoped), o registro do provider de log do hub e o fail fast da connection string;
 - `GoogleAiStudioAdapterParseTests` — o JSON cercado por crases/alvo de markdown é sanitizado antes da
   desserialização (cercas em linha própria, coladas no objeto, rótulo `json` solto e cerca com prosa),
   crases legítimas dentro de um valor de string não são mutadas, o retorno sem arquivo utilizável falha
@@ -634,6 +784,15 @@ Os demais testes cobrem as melhorias arquiteturais:
 - `LuckeOrchestratorWorkerDeliveryTests` — falha no commit do GitHub não é engolida: a tarefa é gravada
   como `Falhou`, um único `LogError` traz o passo que falhou e o contador da frustração (1/3), nenhum PR
   é aberto e a tarefa não é marcada como `Concluida`.
+- `TaskReviewServiceTests` — a API não inventa dados: `POST /api/tasks` persiste `Pendente` com UUID novo;
+  `accept` pede o merge da branch da tarefa, grava `Aprovada` e **não** mexe no medidor de frustração;
+  falha no merge não grava status nenhum (`Aprovada` nunca sai sem merge); `reject` fecha o PR com o
+  motivo, incrementa o contador compartilhado com o histórico (`revisão humana rejeitou a entrega: ...`)
+  e devolve a tarefa para `Pendente`; tarefa inexistente ⇒ `NaoEncontrada`, sem efeito colateral;
+- `SignalRLogStreamingTests` — o provider publica nível/categoria/mensagem formatada/exceção, filtra pelo
+  `MinimumLevel`, trunca a mensagem no teto, mantém o retrovisor circular com os eventos mais recentes,
+  respeita `Enabled` e descarta o log emitido durante a publicação (a trava contra realimentação do
+  canal).
 
 ## Limitações e próximos passos
 
@@ -649,7 +808,14 @@ Os demais testes cobrem as melhorias arquiteturais:
 - **Histórico de falhas global:** a memória da frustração é do daemon (não por tarefa) — o overdrive
   recebe os motivos mais recentes, que podem incluir tarefas anteriores; um `FrustrationTracker` por
   tarefa, com múltiplas retentativas, é a evolução natural.
-
-
-
+- **API sem autenticação:** as rotas de gerenciamento/review e o hub não exigem credencial — elas
+  assumem o perímetro do daemon (bind em `127.0.0.1` ou atrás de um proxy com autenticação). O
+  `AdminToken` é exercido pelo processo, não pelo revisor que usa o painel: expor a API publicamente
+  exige autenticação/HTTPS antes.
+- **Motivo da rejeição não persistido:** o `motivo` fecha o PR (comentário) e entra no histórico de
+  frustração, mas não há coluna em `agent_tasks` para ele — um `review_note` com migration permitiria
+  listar as rejeições no painel sem abrir o PR.
+- **Retrovisor em memória:** o `history` do hub vive no processo (limitado por `LogStreaming:HistorySize`);
+  reiniciar o daemon zera a janela, e um histórico persistido (ou um `journalctl` consultado sob demanda)
+  cobriria o que aconteceu antes do start.
 

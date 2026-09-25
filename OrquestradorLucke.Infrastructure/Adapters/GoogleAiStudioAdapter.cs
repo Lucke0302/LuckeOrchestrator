@@ -60,6 +60,21 @@ public sealed class GoogleAiStudioAdapter(
         Inclua uma chave por arquivo necessário para atender à tarefa.
         """;
 
+    /// <summary>
+    /// Instrução de sumarização do pull request. O contrato (JSON estrito com <c>titulo</c> e
+    /// <c>descricao</c>, sem cercas de markdown e sem campos extras) é fixado aqui — e não inferido a
+    /// cada resposta — porque é o parse dele que preenche o título e o corpo do pull request no host.
+    /// </summary>
+    private const string PullRequestSummaryInstruction =
+        """
+        Resuma a tarefa executada nos moldes de um pull request.
+        Responda EXCLUSIVAMENTE com um objeto JSON válido, sem texto antes ou depois e sem cercas de markdown, no formato exato:
+        {"titulo": "título curto do pull request", "descricao": "corpo do pull request em Markdown"}
+        O valor de "titulo" é uma única linha, no padrão Conventional Commits com o escopo da tarefa (ex.: "feat(modulo): implementa o fluxo x").
+        O valor de "descricao" é o corpo em Markdown: o resumo da mudança e a lista dos arquivos alterados.
+        Não use crases triplas, não inclua comentários e não acrescente nenhum campo além de "titulo" e "descricao".
+        """;
+
     private static readonly JsonSerializerOptions ResponseSerializerOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -104,6 +119,28 @@ public sealed class GoogleAiStudioAdapter(
             artifacts.Count);
 
         return artifacts;
+    }
+
+    /// <summary>
+    /// Sumariza a tarefa para o pull request sob o contrato JSON estrito
+    /// (<c>{"titulo": "...", "descricao": "..."}</c>) e devolve a saída bruta do modelo.
+    /// </summary>
+    /// <inheritdoc />
+    /// <remarks>
+    /// A resposta volta sem tratamento de markdown de propósito: o parse do resumo é do chamador
+    /// (worker), que reaproveita a mesma sanitização dos artefatos e aufere o resumo determinístico
+    /// quando o modelo foge do contrato — o resumo nunca derruba uma entrega já commitada.
+    /// </remarks>
+    public async Task<string> GeneratePullRequestSummaryAsync(string payload, string contextAnalysis, CancellationToken cancellationToken)
+    {
+        EnsureConfiguration();
+        ArgumentNullException.ThrowIfNull(payload);
+
+        return await SendPromptAsync(
+                PullRequestSummaryInstruction,
+                $"{contextAnalysis}{Environment.NewLine}{payload}",
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public Task<string> EvaluateErrorAsync(string payload, string generatedCode, string errorMessage, CancellationToken cancellationToken)

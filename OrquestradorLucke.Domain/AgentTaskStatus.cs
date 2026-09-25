@@ -18,5 +18,12 @@ public enum AgentTaskStatus
     Falhou = 3,
 
     /// <summary>Cancelada por solicitação ou desligamento do host.</summary>
-    Cancelada = 4
+    Cancelada = 4,
+
+    /// <summary>
+    /// Entrega revisada e aprovada pelo revisor humano: o pull request foi mesclado com o token
+    /// administrativo (a conta do agente autônomo não aprova o próprio PR). É o estado terminal do
+    /// ciclo de revisão — <c>Concluida</c> significa "PR aberto aguardando revisão".
+    /// </summary>
+    Aprovada = 5
 }

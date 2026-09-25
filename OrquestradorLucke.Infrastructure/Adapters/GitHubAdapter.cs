@@ -8,15 +8,23 @@ using OrquestradorLucke.Infrastructure.Configuration;
 namespace OrquestradorLucke.Infrastructure.Adapters;
 
 /// <summary>
-/// Adapter do GitHub (conta de agente autônomo). Executa branch, commit e pull request pela
-/// Git Data API do Octokit com o repositório puramente em memória: blobs, árvore e commit são
-/// montados como objetos e trafegam por HTTP, portanto nada é clonado, lido ou escrito no
-/// sistema de arquivos local.
+/// Adapter do GitHub. Executa branch, commit e pull request pela Git Data API do Octokit com o
+/// repositório puramente em memória: blobs, árvore e commit são montados como objetos e trafegam por
+/// HTTP, portanto nada é clonado, lido ou escrito no sistema de arquivos local.
 /// </summary>
 /// <remarks>
-/// As operações são idempotentes: reprocessar uma tarefa que já criou a branch ou o pull request
-/// reutiliza o recurso existente (a API do GitHub responde <c>422</c> nos dois casos) em vez de
-/// derrubar a entrega — cenário comum quando o daemon é reiniciado no meio do ciclo.
+/// <para>
+/// <b>Dual-token (segregação de funções):</b> as operações do agente autônomo usam
+/// <see cref="GitHubOptions.AgentToken"/>; as operações de revisão humana
+/// (<see cref="MergePullRequestAsync"/> e <see cref="ClosePullRequestAsync"/>) usam
+/// <see cref="GitHubOptions.AdminToken"/> — o agente entrega, o revisor aprova, e cada identidade só
+/// exerce o seu papel.
+/// </para>
+/// <para>
+/// As operações do agente são idempotentes: reprocessar uma tarefa que já criou a branch ou o pull
+/// request reutiliza o recurso existente (a API do GitHub responde <c>422</c> nos dois casos) em vez
+/// de derrubar a entrega — cenário comum quando o daemon é reiniciado no meio do ciclo.
+/// </para>
 /// </remarks>
 public sealed class GitHubAdapter : IGitHubService
 {
@@ -49,10 +57,23 @@ public sealed class GitHubAdapter : IGitHubService
     private readonly ILogger<GitHubAdapter> _logger;
 
     /// <summary>
-    /// Cria o adapter e autentica o cliente Octokit. O token vem de <see cref="GitHubOptions"/>
+    /// Cliente Octokit do agente autônomo (<see cref="GitHubOptions.AgentToken"/>): branch, commit,
+    /// pull request e leitura da árvore para o índice do RAG.
+    /// </summary>
+    private readonly GitHubClient Client;
+
+    /// <summary>
+    /// Cliente Octokit do revisor humano (<see cref="GitHubOptions.AdminToken"/>). É <c>null</c> quando
+    /// o token administrativo não está configurado: as operações de revisão falham de forma explícita
+    /// (fail closed) em <see cref="ResolveAdminClient"/> em vez de usar a credencial do agente.
+    /// </summary>
+    private readonly GitHubClient? _adminClient;
+
+    /// <summary>
+    /// Cria o adapter e autentica os clientes Octokit. Os tokens vêm de <see cref="GitHubOptions"/>
     /// (user-secrets ou variável de ambiente) — nunca hardcoded.
     /// </summary>
-    /// <exception cref="InvalidOperationException">Quando <see cref="GitHubOptions.Token"/> não está configurado.</exception>
+    /// <exception cref="InvalidOperationException">Quando <see cref="GitHubOptions.AgentToken"/> não está configurado.</exception>
     public GitHubAdapter(IOptions<GitHubOptions> options, ILogger<GitHubAdapter> logger)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -61,19 +82,44 @@ public sealed class GitHubAdapter : IGitHubService
         _options = options.Value;
         _logger = logger;
 
-        // Fail fast: sem token não há operação possível, e Credentials lançaria algo menos claro na primeira chamada.
-        if (string.IsNullOrWhiteSpace(_options.Token))
+        // Fail fast: sem o token do agente não há entrega possível, e Credentials lançaria algo menos
+        // claro na primeira chamada. O token administrativo é validado na primeira operação de revisão
+        // (opcional para um deploy que não use a API de review).
+        if (string.IsNullOrWhiteSpace(_options.AgentToken))
         {
             throw new InvalidOperationException(
-                $"{nameof(GitHubOptions)}.{nameof(GitHubOptions.Token)} não configurado. Defina via user-secrets ou variável de ambiente.");
+                $"{nameof(GitHubOptions)}.{nameof(GitHubOptions.AgentToken)} não configurado. Defina via user-secrets ou variável de ambiente.");
         }
 
-        Client = new GitHubClient(new ProductHeaderValue(ProductHeaderName));
-        Client.Credentials = new Credentials(_options.Token);
+        Client = CreateClient(_options.AgentToken);
+        _adminClient = string.IsNullOrWhiteSpace(_options.AdminToken) ? null : CreateClient(_options.AdminToken);
     }
 
-    /// <summary>Cliente Octokit autenticado, usado pelas operações de Git e pull request.</summary>
-    internal GitHubClient Client { get; }
+    /// <summary>Cria um cliente Octokit autenticado com o token informado, com o cabeçalho de produto do orquestrador.</summary>
+    private static GitHubClient CreateClient(string token)
+    {
+        var client = new GitHubClient(new ProductHeaderValue(ProductHeaderName));
+
+        client.Credentials = new Credentials(token);
+
+        return client;
+    }
+
+    /// <summary>
+    /// Devolve o cliente autenticado com o token do revisor humano, falhando rápido (e de forma clara)
+    /// quando ele não está configurado.
+    /// </summary>
+    /// <remarks>
+    /// Não existe fallback para o token do agente de propósito: usar a credencial do agente para
+    /// mesclar o próprio pull request anularia a segregação de funções sem que ninguém percebesse.
+    /// </remarks>
+    private GitHubClient ResolveAdminClient()
+        => _adminClient
+            ?? throw new InvalidOperationException(
+                $"{nameof(GitHubOptions)}.{nameof(GitHubOptions.AdminToken)} não configurado: as operações de revisão " +
+                "(merge e fechamento de pull request) usam a identidade do revisor humano. " +
+                "Defina via user-secrets ou variável de ambiente.");
+
 
     /// <inheritdoc />
     /// <remarks>
@@ -340,7 +386,7 @@ public sealed class GitHubAdapter : IGitHubService
                 // Idempotência: a API responde 422 quando já existe pull request aberto para a mesma
                 // branch (retrabalho da tarefa). O PR existente é o resultado esperado da operação, então
                 // a URL dele é devolvida em vez de falhar a entrega já commitada.
-                var existingPullRequest = await FindOpenPullRequestAsync(branchName).ConfigureAwait(false);
+                var existingPullRequest = await FindOpenPullRequestAsync(Client, branchName).ConfigureAwait(false);
 
                 if (existingPullRequest is null)
                 {
@@ -377,7 +423,12 @@ public sealed class GitHubAdapter : IGitHubService
     /// Busca o pull request aberto cuja origem (head) é a branch informada, filtrando pela API com
     /// <c>head = "usuário:branch"</c>. Devolve <c>null</c> quando não há nenhum.
     /// </summary>
-    private async Task<PullRequest?> FindOpenPullRequestAsync(string branchName)
+    /// <param name="client">
+    /// Cliente autenticado da consulta: o do agente quando a leitura é a checagem de idempotência da
+    /// entrega, o do revisor humano quando a operação é de revisão (merge/fechamento).
+    /// </param>
+    /// <param name="branchName">Branch de origem do pull request.</param>
+    private async Task<PullRequest?> FindOpenPullRequestAsync(GitHubClient client, string branchName)
     {
         var request = new PullRequestRequest
         {
@@ -385,7 +436,7 @@ public sealed class GitHubAdapter : IGitHubService
             Head = $"{_options.Owner}:{branchName}"
         };
 
-        var pullRequests = await Client.PullRequest
+        var pullRequests = await client.PullRequest
             .GetAllForRepository(_options.Owner, _options.Repository, request)
             .ConfigureAwait(false);
 
@@ -393,6 +444,165 @@ public sealed class GitHubAdapter : IGitHubService
         // devolvido é realmente o da branch da tarefa.
         return pullRequests.FirstOrDefault(pullRequest =>
             string.Equals(pullRequest.Head?.Ref, branchName, StringComparison.Ordinal));
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// O pull request é localizado pela branch de origem (a mesma <c>feat/task-{id}</c> que o agente já
+    /// conhece) e o merge é feito com o <see cref="GitHubOptions.AdminToken"/>. O GitHub recusa o merge
+    /// com <c>405</c>/<c>409</c> quando a branch está protegida ou há conflito: a exceção do Octokit é
+    /// logada e propagada — o revisor recebe o erro e a tarefa continua com o status anterior, sem
+    /// virar <c>Aprovada</c> por engano.
+    /// </remarks>
+    public async Task<string> MergePullRequestAsync(string branchName, string commitTitle, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        EnsureRepositoryConfiguration();
+        ArgumentException.ThrowIfNullOrWhiteSpace(branchName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(commitTitle);
+
+        var adminClient = ResolveAdminClient();
+        var owner = _options.Owner;
+        var repository = _options.Repository;
+
+        try
+        {
+            var pullRequest = await FindOpenPullRequestAsync(adminClient, branchName).ConfigureAwait(false)
+                ?? throw new InvalidOperationException(
+                    $"Nenhum pull request aberto para a branch '{branchName}' em {owner}/{repository}.");
+
+            var merge = await adminClient.PullRequest
+                .Merge(
+                    owner,
+                    repository,
+                    pullRequest.Number,
+                    new MergePullRequest
+                    {
+                        CommitTitle = commitTitle,
+                        MergeMethod = ResolveMergeMethod()
+                    })
+                .ConfigureAwait(false);
+
+            // merged = false é a recusa silenciosa do GitHub (conflito, branch protegida, checks
+            // pendentes): sem esta checagem a revisão marcaria a tarefa como aprovada sem merge algum.
+            if (!merge.Merged)
+            {
+                throw new InvalidOperationException(
+                    $"O GitHub recusou o merge do pull request #{pullRequest.Number} da branch '{branchName}': {merge.Message}");
+            }
+
+            _logger.LogInformation(
+                "Pull request #{PullRequestNumber} da branch '{Branch}' mesclado em {Owner}/{Repository} pelo revisor (merge {MergeSha}).",
+                pullRequest.Number,
+                branchName,
+                owner,
+                repository,
+                merge.Sha);
+
+            return merge.Sha;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Falha ao mesclar o pull request da branch '{Branch}' em {Owner}/{Repository}.",
+                branchName,
+                owner,
+                repository);
+
+            throw;
+        }
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// O motivo é publicado como comentário no pull request antes do fechamento (a trilha da rejeição
+    /// fica no PR, não só no log do daemon) e o fechamento usa o
+    /// <see cref="GitHubOptions.AdminToken"/>. Sem pull request aberto não há o que fechar: o método
+    /// loga um aviso e devolve — a rejeição é idempotente e o fluxo do revisor segue normalmente.
+    /// </remarks>
+    public async Task ClosePullRequestAsync(string branchName, string reason, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        EnsureRepositoryConfiguration();
+        ArgumentException.ThrowIfNullOrWhiteSpace(branchName);
+
+        var adminClient = ResolveAdminClient();
+        var owner = _options.Owner;
+        var repository = _options.Repository;
+
+        try
+        {
+            var pullRequest = await FindOpenPullRequestAsync(adminClient, branchName).ConfigureAwait(false);
+
+            if (pullRequest is null)
+            {
+                _logger.LogWarning(
+                    "Nenhum pull request aberto para a branch '{Branch}' em {Owner}/{Repository}: nada a fechar na rejeição.",
+                    branchName,
+                    owner,
+                    repository);
+
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(reason))
+            {
+                // Trilha da rejeição no próprio PR: quem abrir o link fechado entende o motivo, sem
+                // depender do log do daemon.
+                await adminClient.Issue.Comment
+                    .Create(owner, repository, pullRequest.Number, $"Revisão rejeitada: {reason}")
+                    .ConfigureAwait(false);
+            }
+
+            var closed = await adminClient.PullRequest
+                .Update(owner, repository, pullRequest.Number, new PullRequestUpdate { State = ItemState.Closed })
+                .ConfigureAwait(false);
+
+            _logger.LogInformation(
+                "Pull request #{PullRequestNumber} da branch '{Branch}' fechado em {Owner}/{Repository} pelo revisor (estado {State}).",
+                pullRequest.Number,
+                branchName,
+                owner,
+                repository,
+                closed.State);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Falha ao fechar o pull request da branch '{Branch}' em {Owner}/{Repository}.",
+                branchName,
+                owner,
+                repository);
+
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Resolve a estratégia de merge configurada (<see cref="GitHubOptions.MergeMethod"/>), caindo em
+    /// <see cref="PullRequestMergeMethod.Merge"/> com aviso quando o valor não corresponde a um método
+    /// conhecido — configuração errada não deve derrubar a revisão.
+    /// </summary>
+    private PullRequestMergeMethod ResolveMergeMethod()
+    {
+        if (Enum.TryParse<PullRequestMergeMethod>(_options.MergeMethod, ignoreCase: true, out var mergeMethod)
+            && Enum.IsDefined(mergeMethod))
+        {
+            return mergeMethod;
+        }
+
+        _logger.LogWarning(
+            "Estratégia de merge '{MergeMethod}' inválida em {Section}:{Property}; usando {Fallback}.",
+            _options.MergeMethod,
+            GitHubOptions.SectionName,
+            nameof(GitHubOptions.MergeMethod),
+            PullRequestMergeMethod.Merge);
+
+        return PullRequestMergeMethod.Merge;
     }
 
     /// <inheritdoc />
