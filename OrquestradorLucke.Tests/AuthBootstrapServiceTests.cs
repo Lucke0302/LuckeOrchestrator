@@ -55,6 +55,10 @@ public sealed class AuthBootstrapServiceTests
         added[0].Username.Should().Be("admin");
         added[0].PasswordHash.Should().Be(PasswordHasher.ComputeHash("senha-do-painel"));
 
+        // A chave é gerada explicitamente: a coluna 'users.id' não tem DEFAULT no PostgreSQL (a
+        // migration não cria gerador), então um Guid vazio seria recusado pelo banco.
+        added[0].Id.Should().NotBe(Guid.Empty);
+
         // A senha em claro não existe na entidade que vai para o banco.
         added[0].PasswordHash.Should().NotBe("senha-do-painel");
         added[0].RefreshToken.Should().BeNull();

@@ -40,6 +40,10 @@ public sealed class AuthBootstrapService(IUserRepository userRepository, AuthBoo
 
         var user = new User
         {
+            // Geração explícita da chave: o Id é do domínio (o banco não tem DEFAULT para a coluna
+            // 'users.id'), então o valor é fixado aqui — não se depende do inicializador da propriedade
+            // nem de um gerador do PostgreSQL, que a migration não cria.
+            Id = Guid.NewGuid(),
             Username = User.NormalizeUsername(settings.Username),
             PasswordHash = PasswordHasher.ComputeHash(settings.Password)
         };
