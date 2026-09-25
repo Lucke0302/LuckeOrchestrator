@@ -138,15 +138,21 @@ public sealed class GeminiChatService(
     /// <summary>Dispara o <c>generateContent</c> do modelo e devolve o texto do primeiro candidato.</summary>
     private async Task<string> GenerateContentAsync(string modelName, string prompt, CancellationToken cancellationToken)
     {
+        // Reforço da regra no fim da fala do operador: alguns modelos (ex.: Gemma) ignoram a
+        // system_instruction, então a mesma exigência é colada no próprio prompt — é a última coisa
+        // lida antes da geração, o que aumenta muito a aderência às tags de raciocínio.
+        var enhancedPrompt =
+            $"{prompt}\n\n[MANDATORY INSTRUCTION: You MUST wrap ALL your internal reasoning and planning inside <think> and </think> XML tags. Immediately after the </think> tag, you MUST provide your final response to the user in Portuguese. Do not output raw bullet points outside of the tags.]";
+
         using var request = new HttpRequestMessage(HttpMethod.Post, BuildEndpointUri(modelName))
         {
-            // A instrução de sistema fixa o contrato das tags de raciocínio e o 'contents' é a fala do
-            // operador. As propriedades saem nomeadas exatamente como a API espera
+            // A instrução de sistema fixa o contrato das tags de raciocínio e o 'contents' carrega a fala
+            // já reforçada do operador. As propriedades saem nomeadas exatamente como a API espera
             // (system_instruction), sem depender de naming policy.
             Content = JsonContent.Create(new
             {
                 system_instruction = new { parts = new[] { new { text = ChainOfThoughtInstruction } } },
-                contents = new[] { new { parts = new[] { new { text = prompt } } } }
+                contents = new[] { new { parts = new[] { new { text = enhancedPrompt } } } }
             })
         };
 
