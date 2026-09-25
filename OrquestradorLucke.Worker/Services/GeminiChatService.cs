@@ -1,14 +1,15 @@
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using OrquestradorLucke.Infrastructure.Configuration;
 
 namespace OrquestradorLucke.Worker.Services;
 
 /// <summary>
 /// Motor de chat do painel: envia a mensagem do operador ao endpoint <c>generateContent</c> do Google
-/// AI Studio e força o modelo a separar raciocínio e resposta final pelo delimitador técnico
-/// <c>FINAL_ANSWER_START</c> — o C# fatia o texto nele e converte o raciocínio nas tags
+/// AI Studio e força o modelo a separar raciocínio e resposta final pelo separador markdown
+/// <c>---</c> — o C# fatia o texto no último separador e converte o raciocínio nas tags
 /// <c>&lt;think&gt;</c> que o painel isola, mostrando a resposta final fora delas.
 /// </summary>
 /// <remarks>
@@ -65,29 +66,29 @@ public sealed class GeminiChatService(
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
 
     /// <summary>
-    /// Delimitador técnico que separa o raciocínio da resposta final: o token em SCREAMING_SNAKE_CASE
-    /// não convida o modelo a comentar o próprio formato — os rótulos em texto puro ('PENSAMENTOS:' /
-    /// 'RESPOSTA:') estimulavam metalinguagem e a resposta acabava dentro de um bullet point.
+    /// Separador que fecha o raciocínio: uma linha markdown de três hífens, o sinal que o modelo
+    /// respeitou de forma consistente — os tokens em texto puro ('FINAL_ANSWER_START') eram ignorados e
+    /// o Gemma ficava preso no modo de planejamento, sem gerar a fala final.
     /// </summary>
-    private const string AnswerDelimiter = "FINAL_ANSWER_START";
+    private const string AnswerDelimiter = "---";
 
     /// <summary>
-    /// Resíduo de markdown que fica colado ao delimitador quando o modelo o embrulha em negrito ou o
-    /// repete como título/bullet/legenda: <c>*</c>, <c>#</c>, <c>-</c>, <c>:</c> e espaço. É varrido das
-    /// duas bordas do corte — a do raciocínio e a da resposta — para o painel não exibir formatação
-    /// órfã; os sinais são os mesmos da limpeza de títulos do worker, com o dois-pontos a mais que o
-    /// modelo costuma colar no delimitador.
+    /// Ruído de markdown colado no início da fala final — asteriscos de negrito, hífens do separador,
+    /// citação, espaços, aspas e quebras de linha. É varrido de uma vez pelo regex, para o painel nunca
+    /// renderizar formatação órfã antes do texto do agente.
     /// </summary>
-    private static readonly char[] ResidualMarkdownCharacters = ['*', '#', '-', ':', ' '];
+    private static readonly Regex AnswerLeadingNoiseRegex = new(
+        @"^[\*\-\>\s""']+",
+        RegexOptions.Compiled);
 
     /// <summary>
-    /// Instrução de sistema que fixa o contrato de resposta baseado no delimitador técnico
-    /// <c>FINAL_ANSWER_START</c>: o raciocínio vem em bullet points e a resposta final e polida vem logo
-    /// abaixo da linha do delimitador — token em SCREAMING_SNAKE_CASE que não estimula o modelo a
-    /// explicar o próprio formato. O C# fatia o texto nele e monta as tags de pensamento do painel.
+    /// Instrução de sistema que fixa o contrato de resposta pelo separador markdown <c>---</c>: o
+    /// raciocínio vem em bullet points e a fala final direta vem abaixo da linha dos três hífens. O
+    /// sinal já pertence ao vocabulário markdown como quebra de seção, então o modelo o produz sem
+    /// comentar o próprio formato, e o C# fatia o texto nele para montar as tags de pensamento do painel.
     /// </summary>
     private const string ChainOfThoughtInstruction =
-        "You are a helpful AI assistant. First, write your internal reasoning in bullet points. When you finish reasoning, write the exact word FINAL_ANSWER_START on a new line and, below it, your final clean response to the user in Portuguese. Do NOT explain the format.";
+        "Você é um assistente prestativo. 1. Pense passo a passo em bullet points. 2. Quando terminar de pensar, escreva uma linha contendo APENAS três hífens (---). 3. Abaixo dos hífens, escreva a sua fala final direta para o usuário em português.";
 
     private readonly IConfiguration _configuration = configuration;
     private readonly ILogger<GeminiChatService> _logger = logger;
@@ -158,8 +159,8 @@ public sealed class GeminiChatService(
     {
         // Reforço do contrato no fim da fala do operador: alguns modelos (ex.: Gemma) ignoram a
         // system_instruction, então a mesma exigência é colada no próprio prompt — é a última coisa
-        // lida antes da geração, o que aumenta muito a aderência ao delimitador técnico.
-        var enhancedPrompt = $"{prompt}\n\n[MANDATORY INSTRUCTION: First, write your internal reasoning in bullet points. When finished, write the exact word FINAL_ANSWER_START on a new line. Below it, write your final clean response in Portuguese. Do NOT explain the format.]";
+        // lida antes da geração, o que aumenta muito a aderência ao separador markdown.
+        var enhancedPrompt = $"{prompt}\n\n[INSTRUÇÃO OBRIGATÓRIA: 1. Pense passo a passo em bullet points. 2. Quando terminar de pensar, escreva uma linha contendo APENAS três hífens (---). 3. Abaixo dos hífens, escreva A SUA FALA FINAL DIRETA para o usuário em português.]";
 
         using var request = new HttpRequestMessage(HttpMethod.Post, BuildEndpointUri(modelName))
         {
@@ -187,11 +188,11 @@ public sealed class GeminiChatService(
     }
 
     /// <summary>
-    /// Lê <c>candidates[0].content.parts[0].text</c> e fatia a resposta do modelo no delimitador técnico
-    /// <c>FINAL_ANSWER_START</c>: o que vem antes é o raciocínio (bullet points) e o que vem depois é a
-    /// resposta final já polida, com o resíduo de markdown do delimitador varrido das duas bordas. O
-    /// resultado sai no contrato de tags do painel (<c>&lt;think&gt;{thoughts}&lt;/think&gt;</c> seguido
-    /// da resposta). Texto ausente continua sendo falha — a última tentativa escala para o fallback.
+    /// Lê <c>candidates[0].content.parts[0].text</c> e fatia a resposta do modelo no <b>último</b>
+    /// separador markdown <c>---</c>: o que vem antes é o raciocínio (bullet points) e o que vem depois
+    /// é a fala final, já sem o ruído de markdown que o modelo cola na frente dela. O resultado sai no
+    /// contrato de tags do painel (<c>&lt;think&gt;{thoughts}&lt;/think&gt;</c> seguido da resposta).
+    /// Texto ausente continua sendo falha — a última tentativa escala para o fallback.
     /// </summary>
     /// <exception cref="InvalidOperationException">Quando o envelope não traz texto útil.</exception>
     private static string ExtractReplyText(string rawResponse)
@@ -209,25 +210,24 @@ public sealed class GeminiChatService(
         string thoughts;
         string answer;
 
-        if (rawText.Contains(AnswerDelimiter, StringComparison.OrdinalIgnoreCase))
+        if (rawText.Contains(AnswerDelimiter))
         {
-            var delimiterIndex = rawText.IndexOf(AnswerDelimiter, StringComparison.OrdinalIgnoreCase);
+            // O separador pode reaparecer no meio do raciocínio: o corte é no ÚLTIMO, que é o que o
+            // modelo escreve ao terminar de pensar, imediatamente antes da fala final.
+            var lastIndex = rawText.LastIndexOf(AnswerDelimiter);
 
-            // Tudo que vem antes do delimitador é o raciocínio; o TrimEnd varre o resíduo que sobra
-            // quando o modelo embrulha o token em negrito — o '**' de abertura cai neste trecho.
-            thoughts = rawText.Substring(0, delimiterIndex).TrimEnd(ResidualMarkdownCharacters).Trim();
-
-            // Tudo que vem depois é a resposta: o '**' de fechamento e qualquer bullet/título colado ao
-            // delimitador saem no TrimStart, e o Trim final descarta as quebras de linha remanescentes.
-            answer = rawText.Substring(delimiterIndex + AnswerDelimiter.Length)
-                            .TrimStart(ResidualMarkdownCharacters)
-                            .Trim();
+            thoughts = rawText.Substring(0, lastIndex).Trim();
+            answer = rawText.Substring(lastIndex + AnswerDelimiter.Length).Trim();
         }
         else
         {
             thoughts = "O modelo processou a resposta diretamente.";
             answer = rawText;
         }
+
+        // Regex implacável: qualquer asterisco, hífen, citação, espaço, aspas ou quebra de linha colado
+        // no exato início da resposta sai antes de o texto chegar ao painel.
+        answer = AnswerLeadingNoiseRegex.Replace(answer, string.Empty);
 
         var finalParsedText = $"<think>\n{thoughts}\n</think>\n\n{answer}";
 
