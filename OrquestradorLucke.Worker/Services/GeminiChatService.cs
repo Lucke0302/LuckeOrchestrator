@@ -7,9 +7,9 @@ namespace OrquestradorLucke.Worker.Services;
 
 /// <summary>
 /// Motor de chat do painel: envia a mensagem do operador ao endpoint <c>generateContent</c> do Google
-/// AI Studio e força o modelo a separar raciocínio e resposta final pelo cabeçalho Markdown
-/// <c>### Resposta</c> — o C# converte isso nas tags <c>&lt;think&gt;</c> que o painel isola,
-/// mostrando a resposta final fora delas.
+/// AI Studio e força o modelo a separar raciocínio e resposta final pelos rótulos em texto puro
+/// <c>PENSAMENTOS:</c> e <c>RESPOSTA:</c> — o C# fatia o texto nessa âncora e converte o raciocínio
+/// nas tags <c>&lt;think&gt;</c> que o painel isola, mostrando a resposta final fora delas.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -65,13 +65,13 @@ public sealed class GeminiChatService(
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
 
     /// <summary>
-    /// Instrução de sistema que fixa o contrato de resposta baseado no cabeçalho Markdown
-    /// <c>### Resposta</c>: o raciocínio vem em bullet points e a resposta final limpa vem logo abaixo
-    /// do cabeçalho — formato que modelos Instruct dominam nativamente, sem tags XML nem JSON. O C#
-    /// converte isso nas tags de pensamento do painel.
+    /// Instrução de sistema que fixa o contrato de resposta baseado nas âncoras em texto puro
+    /// <c>PENSAMENTOS:</c> e <c>RESPOSTA:</c>: o raciocínio vem em bullet points sob a primeira e a
+    /// resposta final e polida vem sob a segunda — formato que modelos Instruct dominam nativamente,
+    /// sem tags XML nem JSON. O C# fatia o texto nessa âncora e monta as tags de pensamento do painel.
     /// </summary>
     private const string ChainOfThoughtInstruction =
-        "You are a helpful AI assistant. 1. Write your internal reasoning in bullet points. 2. When you finish reasoning, write EXACTLY the markdown header '### Resposta' on a new line. 3. Write your final, clean response to the user in Portuguese, without bullets or quotes.";
+        "Você é um assistente prestativo. Toda vez que você responder, você DEVE usar EXATAMENTE este formato de texto: primeiro a âncora 'PENSAMENTOS:' com seu raciocínio interno em bullet points e, em seguida, a âncora 'RESPOSTA:' com sua resposta final e polida para o usuário, sem bullets nem aspas.";
 
     private readonly IConfiguration _configuration = configuration;
     private readonly ILogger<GeminiChatService> _logger = logger;
@@ -142,8 +142,8 @@ public sealed class GeminiChatService(
     {
         // Reforço do contrato no fim da fala do operador: alguns modelos (ex.: Gemma) ignoram a
         // system_instruction, então a mesma exigência é colada no próprio prompt — é a última coisa
-        // lida antes da geração, o que aumenta muito a aderência ao delimitador.
-        var enhancedPrompt = $"{prompt}\n\n[MANDATORY INSTRUCTION: 1. Write your internal reasoning in bullet points. 2. When you finish reasoning, write EXACTLY the markdown header '### Resposta' on a new line. 3. Write your final, clean response to the user in Portuguese.]";
+        // lida antes da geração, o que aumenta muito a aderência à âncora 'RESPOSTA:'.
+        var enhancedPrompt = $"{prompt}\n\n[MANDATORY INSTRUCTION: Você é um assistente prestativo. Toda vez que você responder, você DEVE usar EXATAMENTE este formato de texto:\n\nPENSAMENTOS:\n(seu raciocínio interno em bullet points)\n\nRESPOSTA:\n(sua resposta final e polida para o usuário)]";
 
         using var request = new HttpRequestMessage(HttpMethod.Post, BuildEndpointUri(modelName))
         {
@@ -171,9 +171,9 @@ public sealed class GeminiChatService(
     }
 
     /// <summary>
-    /// Lê <c>candidates[0].content.parts[0].text</c> e divide a resposta do modelo pelo cabeçalho
-    /// Markdown <c>### Resposta</c>: o que vem antes é o raciocínio (bullet points) e o que vem depois
-    /// é a resposta final já limpa. O resultado sai no contrato de tags do painel
+    /// Lê <c>candidates[0].content.parts[0].text</c> e fatia a resposta do modelo na âncora
+    /// <c>RESPOSTA:</c>: o que vem antes é o raciocínio (com o rótulo <c>PENSAMENTOS:</c> removido) e o
+    /// que vem depois é a resposta final já polida. O resultado sai no contrato de tags do painel
     /// (<c>&lt;think&gt;{thoughts}&lt;/think&gt;</c> seguido da resposta). Texto ausente continua sendo
     /// falha — a última tentativa escala para o fallback.
     /// </summary>
@@ -192,15 +192,20 @@ public sealed class GeminiChatService(
 
         string thoughts;
         string answer;
-        var delimiter = "### Resposta";
+        var delimiter = "RESPOSTA:";
 
-        if (rawText.Contains(delimiter))
+        if (rawText.Contains(delimiter, StringComparison.OrdinalIgnoreCase))
         {
-            var parts = rawText.Split(delimiter, StringSplitOptions.None);
-            thoughts = parts[0].Trim();
+            // Pega o índice onde começa a palavra RESPOSTA:
+            var delimiterIndex = rawText.IndexOf(delimiter, StringComparison.OrdinalIgnoreCase);
 
-            // Limpeza agressiva do início/fim da resposta para remover bullets (*, -) e aspas que o Gemma injeta.
-            answer = parts[1].TrimStart('*', '-', ' ').Trim('"', '\'').Trim();
+            // Tudo que vem antes é pensamento (removemos a palavra PENSAMENTOS: se ela existir)
+            thoughts = rawText.Substring(0, delimiterIndex)
+                              .Replace("PENSAMENTOS:", "", StringComparison.OrdinalIgnoreCase)
+                              .Trim();
+
+            // Tudo que vem depois é a resposta limpa
+            answer = rawText.Substring(delimiterIndex + delimiter.Length).Trim();
         }
         else
         {
