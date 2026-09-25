@@ -2,11 +2,13 @@ using System.Security.Cryptography;
 using System.Text;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using OrquestradorLucke.Application.Models;
 using OrquestradorLucke.Application.Services;
 using OrquestradorLucke.Worker;
 using OrquestradorLucke.Worker.Configuration;
 using OrquestradorLucke.Worker.Endpoints;
 using OrquestradorLucke.Worker.Logging;
+using OrquestradorLucke.Worker.Services;
 
 // Host web (Kestrel) + BackgroundService: o daemon mantém o laço do orquestrador e passa a ser o
 // back-end em tempo real da aplicação — webhook do GitHub, API de gerenciamento/revisão e streaming
@@ -115,6 +117,45 @@ app.MapAuthEndpoints();
 // API de gerenciamento/revisão do painel web: listar, enfileirar, aprovar (merge com o AdminToken) e
 // rejeitar (fecha o PR, alimenta o medidor de frustração e devolve a tarefa para Pendente).
 app.MapTaskEndpoints();
+
+// Chat do agente: porta administrativa do motor de chat do Gemini (mesma credencial das rotas
+// /api/tasks — o `[Authorize]` em Minimal API é o RequireAuthorization). O serviço entrega o
+// raciocínio isolado nas tags de pensamento e a nota de tentativas prontos para o painel.
+app.MapPost("/api/chat", async (
+    ChatRequest request,
+    GeminiChatService chatService,
+    ILoggerFactory loggerFactory,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Message))
+    {
+        return Results.Problem(
+            title: "Mensagem obrigatória",
+            detail: "O campo 'message' é obrigatório para o chat do agente.",
+            statusCode: StatusCodes.Status400BadRequest);
+    }
+
+    try
+    {
+        var response = await chatService
+            .SendMessageAsync(request.Message, cancellationToken)
+            .ConfigureAwait(false);
+
+        return Results.Ok(new ChatResponse(response));
+    }
+    catch (Exception ex)
+    {
+        // O motor já esgotou as tentativas (e o fallback): o painel recebe o motivo, não um 500 opaco.
+        loggerFactory
+            .CreateLogger("OrquestradorLucke.Api.Chat")
+            .LogError(ex, "Falha no chat do agente para a mensagem recebida.");
+
+        return Results.Problem(
+            title: "Falha no chat do agente",
+            detail: ex.Message,
+            statusCode: StatusCodes.Status502BadGateway);
+    }
+}).RequireAuthorization();
 
 // Streaming de logs: o hub entrega ao painel o log da aplicação em tempo real (o provider capturado
 // em AddManagementApi alimenta o canal que o LogBroadcastService publica aqui).

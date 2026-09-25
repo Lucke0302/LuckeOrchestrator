@@ -17,6 +17,7 @@ using OrquestradorLucke.Infrastructure.Quota;
 using OrquestradorLucke.Infrastructure.Security;
 using OrquestradorLucke.Worker.Configuration;
 using OrquestradorLucke.Worker.Logging;
+using OrquestradorLucke.Worker.Services;
 using Polly;
 
 namespace OrquestradorLucke.Worker;
@@ -141,6 +142,11 @@ public static class DependencyInjectionSetup
         // Casos de uso de revisão (accept/reject) e criação de tarefas: Scoped, junto do repositório e
         // do adapter do GitHub que ele consome.
         services.AddScoped<TaskReviewService>();
+
+        // Motor de chat do painel: typed client (o IHttpClientFactory é quem gerencia os sockets). A
+        // resiliência — retry, fallback de modelo e contrato das tags de raciocínio — é interna ao
+        // serviço, que por isso NÃO recebe a política Polly dos experts MoE.
+        services.AddHttpClient<GeminiChatService>();
 
         // CORS: o painel web roda em outra origem (localhost em desenvolvimento) e precisa alcançar a
         // API e o negotiate do hub. As origens vêm da configuração — nada hardcoded.

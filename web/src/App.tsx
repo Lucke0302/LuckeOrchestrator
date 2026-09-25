@@ -2,6 +2,7 @@ import { BrowserRouter, Navigate, Outlet, Route, Routes } from 'react-router-dom
 import { Skeleton } from './components/ui/Skeleton'
 import { useAuth } from './contexts/AuthContext'
 import { AuthProvider } from './contexts/AuthProvider'
+import Dashboard from './pages/Dashboard'
 import Login from './pages/Login'
 
 /**
@@ -33,7 +34,7 @@ function ProtectedRoute() {
 
 /**
  * Casca do painel: provê a sessão (`AuthProvider`) e roteia as telas. As páginas ficam em
- * `src/pages` — por ora só o login; o dashboard substitui o placeholder de `/`.
+ * `src/pages`: `/login` (autenticação) e `/` (dashboard, só com sessão aberta).
  */
 function App() {
   return (
@@ -42,14 +43,7 @@ function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route element={<ProtectedRoute />}>
-            <Route
-              path="/"
-              element={
-                <main className="flex min-h-screen items-center justify-center bg-lucke-blue-darkest p-6">
-                  <div>Dashboard do Orquestrador (Em Breve)</div>
-                </main>
-              }
-            />
+            <Route path="/" element={<Dashboard />} />
           </Route>
         </Routes>
       </BrowserRouter>
