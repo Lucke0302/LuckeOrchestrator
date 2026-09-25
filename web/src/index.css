@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Dark mode nativo: a paleta do painel já é escura, então o esquema de cores do
+   navegador (scrollbars, inputs, autofill) acompanha. */
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply min-h-screen bg-lucke-blue-darkest font-sans text-lucke-blue-lighter antialiased;
+}
+
+#root {
+  @apply min-h-screen;
+}
