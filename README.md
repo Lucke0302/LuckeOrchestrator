@@ -626,10 +626,16 @@ await connection.start();
 ### CORS
 
 `Cors:AllowedOrigins` lista as origens do painel (as portas usuais de desenvolvimento — `localhost` em
-`3000`/`4200`/`5173`/`8080` e os equivalentes em `127.0.0.1` — já vêm no `appsettings.json`); a política
-`LuckeWebClient` (`AllowAnyHeader` + `AllowAnyMethod` + `AllowCredentials`) é aplicada por
-`app.UseCors(...)` antes do webhook, da API e do hub, então o `negotiate` do SignalR também passa por
-ela. Lista vazia ⇒ nenhuma origem cruzada liberada (e nada quebra no start).
+`3000`/`4173`/`4200`/`5173`/`8080` e os equivalentes em `127.0.0.1` — já vêm no `appsettings.json`);
+a política `WebDashboardPolicy` (`AllowAnyHeader` + `AllowAnyMethod` + `AllowCredentials`) é aplicada
+por `app.UseCors(...)`, o **primeiro** middleware do pipeline — antes do `UseAuthentication`, do
+`UseAuthorization`, do webhook, da API e do hub —, então o preflight `OPTIONS` do login e o `negotiate`
+do SignalR também passam por ela. A lista aceita as duas formas de configuração e as **soma**: os
+itens do array do `appsettings.json` (as portas de desenvolvimento) e uma única string separada por
+vírgula no valor escalar de uma variável de ambiente — o formato que
+`Cors__AllowedOrigins="https://painel.vercel.app,http://localhost:4173"` impõe —, então a URL do
+painel publicado entra sem tocar no código. Lista vazia ⇒ nenhuma origem cruzada liberada (e nada
+quebra no start).
 
 ## Configuração e segredos
 
@@ -655,7 +661,7 @@ ela. Lista vazia ⇒ nenhuma origem cruzada liberada (e nada quebra no start).
 | `Orchestrator:QuotaCooldownMinutes` | cooldown do laço quando toda a cadeia MoE está bloqueada |
 | `Orchestrator:IndexingIntervalMinutes` | cadência (rede de segurança) do indexador do RAG |
 | `ASPNETCORE_URLS` | endereço/porta do host HTTP que atende o webhook, a API e o hub (default do Kestrel quando omitido) |
-| `Cors:AllowedOrigins` | origens do painel web liberadas no CORS (API + `negotiate` do hub) |
+| `Cors:AllowedOrigins` | origens do painel web liberadas no CORS (API + `negotiate` do hub); aceita array ou lista separada por vírgula |
 | `LogStreaming:Enabled` / `MinimumLevel` / `QueueCapacity` / `HistorySize` / `MaxMessageLength` | streaming de logs: liga/desliga, nível publicado, fila, retrovisor e truncamento |
 
 > **Atenção (systemd/Production):** user-secrets e `appsettings.Development.json` **não** são

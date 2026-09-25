@@ -50,8 +50,10 @@ DependencyInjectionSetup.ValidateOrchestratorComposition(builder.Services);
 
 var app = builder.Build();
 
-// CORS antes dos endpoints: o painel web (outra origem) alcança a API e o negotiate do hub. As
-// origens vêm de Cors:AllowedOrigins — sem origem liberada, o navegador simplesmente é bloqueado.
+// CORS é o PRIMEIRO middleware do pipeline (a política se chama CorsSettings.PolicyName, isto é,
+// "WebDashboardPolicy"): o painel web roda em outra origem e precisa alcançar a API e o negotiate
+// do hub — inclusive o preflight OPTIONS do login, que chega antes de qualquer autenticação. As
+// origens vêm de Cors:AllowedOrigins; sem origem liberada, o navegador simplesmente é bloqueado.
 app.UseCors(CorsSettings.PolicyName);
 
 // Autenticação e autorização ANTES dos endpoints: /api/tasks e o hub de logs exigem um access token

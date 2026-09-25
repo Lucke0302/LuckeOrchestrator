@@ -1,14 +1,17 @@
 using FluentAssertions;
+using Microsoft.AspNetCore.Cors.Infrastructure;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using OrquestradorLucke.Application.Interfaces;
 using OrquestradorLucke.Application.Services;
 using OrquestradorLucke.Domain;
 using OrquestradorLucke.Infrastructure.Data;
 using OrquestradorLucke.Infrastructure.Quota;
 using OrquestradorLucke.Worker;
+using OrquestradorLucke.Worker.Configuration;
 using OrquestradorLucke.Worker.Logging;
 
 namespace OrquestradorLucke.Tests;
@@ -102,6 +105,60 @@ public sealed class OrchestratorCompositionTests
         var act = () => DependencyInjectionSetup.ValidateOrchestratorComposition(services);
 
         act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void AddManagementApi_DeveLiberarAsOrigensDoPainelComCredenciais()
+    {
+        // O painel web (Vite em 5173 e o preview em 4173) chama a API de outra origem e o SignalR
+        // exige credenciais (AllowCredentials) — e a lista em UMA string separada por vírgula, o
+        // formato de Cors__AllowedOrigins (variável de ambiente), tem de produzir o mesmo resultado
+        // do array do appsettings: split, recorte de espaços e deduplicação.
+        var services = CreateHostServices();
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Cors:AllowedOrigins"] = "http://localhost:5173, http://localhost:4173 ,,http://localhost:5173"
+            })
+            .Build();
+
+        services.AddManagementApi(configuration);
+
+        using var provider = services.BuildServiceProvider();
+
+        var policy = provider.GetRequiredService<IOptions<CorsOptions>>()
+            .Value
+            .GetPolicy(CorsSettings.PolicyName);
+
+        policy.Should().NotBeNull();
+        policy!.Origins.Should().Equal("http://localhost:5173", "http://localhost:4173");
+        policy.AllowAnyHeader.Should().BeTrue();
+        policy.AllowAnyMethod.Should().BeTrue();
+        policy.SupportsCredentials.Should().BeTrue();
+    }
+
+    [Fact]
+    public void AddManagementApi_DeveLiberarAsOrigensDoArrayDoAppsettings()
+    {
+        var services = CreateHostServices();
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Cors:AllowedOrigins:0"] = "http://localhost:5173",
+                ["Cors:AllowedOrigins:1"] = " http://localhost:4173 "
+            })
+            .Build();
+
+        services.AddManagementApi(configuration);
+
+        using var provider = services.BuildServiceProvider();
+
+        var policy = provider.GetRequiredService<IOptions<CorsOptions>>()
+            .Value
+            .GetPolicy(CorsSettings.PolicyName);
+
+        policy.Should().NotBeNull();
+        policy!.Origins.Should().Equal("http://localhost:5173", "http://localhost:4173");
     }
 
     [Fact]

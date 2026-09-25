@@ -15,6 +15,12 @@ export const API_BASE_URL: string =
  */
 export const ACCESS_TOKEN_STORAGE_KEY = 'lucke.accessToken'
 
+/**
+ * Chave do refresh token no `localStorage`. É o `AuthContext` que grava/limpa o valor (o interceptor
+ * não o usa); quando o access token expirar, o par é trocado em `/auth/refresh` com esta credencial.
+ */
+export const REFRESH_TOKEN_STORAGE_KEY = 'lucke.refreshToken'
+
 /** Instância única do Axios usada por todos os serviços HTTP do painel. */
 export const api = axios.create({
   baseURL: API_BASE_URL,

@@ -390,19 +390,39 @@ public static class DependencyInjectionSetup
     /// <summary>
     /// Lê as origens liberadas no CORS na composição (a política é construída antes do host subir):
     /// espaços são removidos, entradas vazias são descartadas e a lista é deduplicada — uma vírgula a
-    /// mais no appsettings não derruba o start.
+    /// mais no appsettings (ou na variável de ambiente) não derruba o start.
     /// </summary>
     private static CorsSettings ReadCorsSettings(IConfiguration configuration)
     {
         var section = configuration.GetSection(CorsSettings.SectionName);
         var settings = section.Exists() ? section.Get<CorsSettings>() ?? new CorsSettings() : new CorsSettings();
 
-        settings.AllowedOrigins = settings.AllowedOrigins
-            .Where(origin => !string.IsNullOrWhiteSpace(origin))
-            .Select(origin => origin.Trim())
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        settings.AllowedOrigins = ReadAllowedOrigins(section).ToArray();
 
         return settings;
+    }
+
+    /// <summary>
+    /// Extrai as origens da seção <c>Cors</c> somando as duas formas de configuração possíveis: os
+    /// itens do array do <c>appsettings.json</c> e o valor escalar de uma variável de ambiente — que
+    /// não tem como representar um array e impõe uma única string separada por vírgula
+    /// (<c>Cors__AllowedOrigins=https://painel.vercel.app,http://localhost:4173</c>, o caminho para
+    /// acrescentar a URL do painel publicado sem tocar no código). As duas fontes passam pelo mesmo
+    /// recorte, então uma origem repetida entre elas entra uma única vez.
+    /// </summary>
+    private static IEnumerable<string> ReadAllowedOrigins(IConfiguration section)
+    {
+        var originsSection = section.GetSection(nameof(CorsSettings.AllowedOrigins));
+
+        var configuredValues = originsSection.GetChildren()
+            .Select(child => child.Value)
+            .Append(originsSection.Value);
+
+        return configuredValues
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .SelectMany(value => value!.Split(
+                ',',
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
     }
 }
